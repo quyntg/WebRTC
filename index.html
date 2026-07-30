@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="vi">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+        <title>Avatar WebRTC — Simli + Gemini Live</title>
+        <link rel="stylesheet" href="style.css" />
+    </head>
+    <body>
+        <!-- ============================================================
+       MÀN HÌNH CHÀO (WELCOME SCREEN)
+       Bắt buộc theo yêu cầu bảo mật trình duyệt: audio/mic chỉ được
+       xin quyền và phát sau một cú click thật của người dùng.
+  ============================================================= -->
+        <section id="welcomeScreen" class="welcome-screen">
+            <div class="welcome-card">
+                <div class="welcome-badge">Trợ lý AI trực tuyến</div>
+                <h1>Sẵn sàng trò chuyện cùng Avatar AI</h1>
+                <p>Nhấn vào nút bên dưới để cấp quyền micro và bắt đầu cuộc gọi thời gian thực.</p>
+                <button id="startBtn" class="start-btn">
+                    <span class="start-btn-icon" aria-hidden="true"></span> Nhấn vào đây để bắt đầu trò chuyện </button>
+                <p id="permissionError" class="permission-error" hidden></p>
+                <ul class="welcome-notes">
+                    <li>Trình duyệt sẽ hỏi quyền sử dụng micro — hãy chọn "Cho phép".</li>
+                    <li>Ứng dụng chỉ hoạt động trên HTTPS hoặc localhost.</li>
+                </ul>
+            </div>
+        </section>
+        <!-- ============================================================
+       ỨNG DỤNG CHÍNH — 2 TRẠNG THÁI KHUNG NHÌN
+       Trạng thái 1 (mặc định): avatar chiếm toàn bộ trung tâm
+       Trạng thái 2 (khi có FAQ/GIF): avatar thu nhỏ về góc trên trái
+  ============================================================= -->
+        <main id="appScreen" class="app-screen" hidden>
+            <header class="topbar">
+                <div class="topbar-status">
+                    <span id="connectionDot" class="status-dot"></span>
+                    <span id="connectionLabel">Đang kết nối...</span>
+                </div>
+                <div class="topbar-actions">
+                    <button id="toggleFaqBtn" class="ghost-btn" type="button">Hiện FAQ minh hoạ</button>
+                    <button id="micBtn" class="ghost-btn" type="button" aria-pressed="true">
+                        <span id="micIcon" aria-hidden="true"></span>
+                        <span id="micLabel">Micro bật</span>
+                    </button>
+                    <button id="endBtn" class="end-btn" type="button">Kết thúc</button>
+                </div>
+            </header>
+            <div id="stage" class="stage stage--default">
+                <!-- Khung Avatar: chứa thẻ video WebRTC chuẩn -->
+                <div id="avatarFrame" class="avatar-frame">
+                    <!-- <video id="avatarVideo" class="avatar-video" autoplay playsinline poster=""> Trình duyệt của bạn không hỗ trợ thẻ video. </video> -->
+                    <img id="avatarVideo" class="avatar-video" src="/ava doc.jpg" alt="Khung video Avatar AI" />
+                    <div id="avatarPlaceholder" class="avatar-placeholder">
+                        <span class="avatar-placeholder-ring"></span>
+                        <p>Avatar sẽ hiển thị tại đây khi luồng WebRTC từ Simli kết nối thành công</p>
+                    </div>
+                    <span id="speakingIndicator" class="speaking-indicator" hidden>Đang nói...</span>
+                </div>
+                <!-- Thẻ audio ẩn: dự phòng khi thẻ video không mang track âm thanh -->
+                <audio id="remoteAudio" autoplay hidden></audio>
+                <!-- Khung GIF minh hoạ: chỉ hiện ở Trạng thái 2 (FAQ) -->
+                <div id="faqPanel" class="faq-panel" hidden>
+                    <div class="faq-panel-header">
+                        <h2>Nội dung minh hoạ</h2>
+                        <p>Hiển thị song song khi trợ lý đang giải thích một câu hỏi thường gặp.</p>
+                    </div>
+                    <div class="faq-gif-wrap">
+                        <img id="faqGif" class="faq-gif" src="/tutorial.gif" alt="Ảnh GIF minh hoạ nội dung FAQ" />
+                    </div>
+                </div>
+            </div>
+            <footer class="transcript-bar">
+                <p id="transcriptText">Đang chờ bạn nói...</p>
+            </footer>
+        </main>
+        <script src="script.js"></script>
+    </body>
+</html>
