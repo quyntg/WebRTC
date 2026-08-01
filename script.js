@@ -162,6 +162,10 @@ function setAvatarState(state) {
 			isFaqVisible = false;
 			applyFaqState(false);
 		}
+		// 🔴 FIX: Reset volume detection để có thể listening lại
+		if (localMicStream && !DEV_MODE) {
+			resetMicVolumeDetection();
+		}
 	}
 	
 	transcriptText.textContent = label;
@@ -404,12 +408,7 @@ async function sendMessageToGemini(userMessage = 'Xin chào') {
 		// 🔴 PHÁT ÂM THANH RESPONSE (cần Text-to-Speech)
 		speakText(responseText);
 		
-		// Sau khi nói xong, quay về idle
-		setTimeout(() => {
-			if (!isAvatarInCornerMode) {
-				setAvatarState('idle');
-			}
-		}, 3000);
+		// ⭐ Không cần setTimeout nữa - onend callback sẽ quay về idle
 		
 	} catch (err) {
 		console.error('❌ Lỗi gửi message:', err);
@@ -680,7 +679,7 @@ QUY TẮC:
 4. Luôn trả lời bằng Tiếng Việt.`;
 		
 		const response = await fetch(
-			'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash-latest:generateContent?key=' + 
+			'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key=' + 
 			GEMINI_LIVE_CONFIG.apiKey,
 			{
 				method: 'POST',
@@ -819,10 +818,17 @@ function speakText(text) {
 	
 	utterance.onend = () => {
 		console.log('✓ Phát âm thanh xong');
+		isGeminiSpeaking = false; // 🔴 FIX: Reset flag khi TTS phát xong
+		setAvatarState('idle');
+		if (!isAvatarInCornerMode) {
+			// Resume volume detection để listening lại
+			setupMicVolumeDetection();
+		}
 	};
 	
 	utterance.onerror = (event) => {
 		console.error('❌ Lỗi Text-to-Speech:', event.error);
+		isGeminiSpeaking = false; // 🔴 FIX: Reset flag kể cả khi lỗi
 	};
 	
 	window.speechSynthesis.speak(utterance);
@@ -1103,6 +1109,15 @@ function stopVolumeDetection() {
 		maxListeningTimeout = null;
 	}
 	console.log('✓ Volume detection đã dừng');
+}
+
+// 🔴 FIX: Reset volume detection khi quay về idle
+function resetMicVolumeDetection() {
+	stopVolumeDetection();
+	if (localMicStream) {
+		console.log('🔄 Reset volume detection để listening lại');
+		setupMicVolumeDetection();
+	}
 }
 
 /* ==================================================================
