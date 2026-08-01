@@ -86,6 +86,7 @@ let audioBuffer = []; // Buffer audio chunks từ Gemini
 let faqData = [];
 let isAvatarInCornerMode = false;
 let startListeningBtn;
+let fullscreenBtn;
 
 /* ==================================================================
    TIỆN ÍCH
@@ -182,6 +183,43 @@ function applyFaqState(show) {
 	faqPanel.style.display = show ? 'flex' : 'none';
 	toggleFaqBtn.textContent = show ? 'Ẩn FAQ minh hoạ' : 'Hiện FAQ minh hoạ';
 	isAvatarInCornerMode = show;
+}
+
+/* ==================================================================
+   FULLSCREEN TOGGLE
+================================================================== */
+function toggleFullscreen() {
+	const elem = document.documentElement;
+	const isCurrentlyFullscreen = document.fullscreenElement !== null || 
+	                               document.webkitFullscreenElement !== null;
+	
+	if (!isCurrentlyFullscreen) {
+		// Enter fullscreen
+		if (elem.requestFullscreen) {
+			elem.requestFullscreen().catch(err => {
+				console.error('❌ Lỗi vào fullscreen:', err);
+			});
+		} else if (elem.webkitRequestFullscreen) {
+			elem.webkitRequestFullscreen();
+		}
+	} else {
+		// Exit fullscreen
+		if (document.exitFullscreen) {
+			document.exitFullscreen();
+		} else if (document.webkitExitFullscreen) {
+			document.webkitExitFullscreen();
+		}
+	}
+}
+
+function updateFullscreenButtonState() {
+	const isFullscreen = document.fullscreenElement !== null || 
+	                     document.webkitFullscreenElement !== null;
+	
+	if (fullscreenBtn) {
+		fullscreenBtn.classList.toggle('fullscreen-active', isFullscreen);
+		fullscreenBtn.title = isFullscreen ? 'Thoát toàn màn hình' : 'Toàn màn hình';
+	}
 }
 
 /* ==================================================================
@@ -1180,6 +1218,9 @@ function attachEventListeners() {
 	// NÚT "BẮT ĐẦU TRÒ CHUYỆN"
 	startBtn.addEventListener('click', handleStartClick);
 
+	// NÚT FULLSCREEN
+	fullscreenBtn.addEventListener('click', toggleFullscreen);
+
 	// NÚT "BẮTĐẦU LẮNG NGHE" (trong app screen)
 	startListeningBtn.addEventListener('click', () => {
 		console.log('🔑 Nhấn nút "Bắt đầu trò chuyện"');
@@ -1288,13 +1329,14 @@ document.addEventListener('DOMContentLoaded', () => {
 	speakingIndicator = document.getElementById('speakingIndicator');
 	faqPanel = document.getElementById('faqPanel');
 	transcriptText = document.getElementById('transcriptText');
+	fullscreenBtn = document.getElementById('fullscreenBtn');
 
 	// Kiểm tra xem tất cả elements đã load
 	const elements = {
 		welcomeScreen, appScreen, startBtn, transcriptText, stage, 
 		toggleFaqBtn, micBtn, micLabel, endBtn, connectionDot, 
 		connectionLabel, avatarVideo, avatarPlaceholder, remoteAudio,
-		speakingIndicator, faqPanel, permissionError
+		speakingIndicator, faqPanel, permissionError, fullscreenBtn
 	};
 
 	for (const [key, el] of Object.entries(elements)) {
@@ -1305,6 +1347,13 @@ document.addEventListener('DOMContentLoaded', () => {
 
 	// Gắn event listeners
 	attachEventListeners();
+	
+	// Fullscreen event listeners
+	document.addEventListener('fullscreenchange', updateFullscreenButtonState);
+	document.addEventListener('webkitfullscreenchange', updateFullscreenButtonState);
+	document.addEventListener('mozfullscreenchange', updateFullscreenButtonState);
+	document.addEventListener('MSFullscreenChange', updateFullscreenButtonState);
+	
 	console.log('✓ Khởi tạo hoàn tát');
 });
 
