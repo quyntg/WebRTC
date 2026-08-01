@@ -3,7 +3,7 @@
 ================================================================== */
 
 // ⚠️ CHẾ ĐỘ PHÁT TRIỂN: bật để bypass quyền micro và test giao diện
-const DEV_MODE = false;
+const DEV_MODE = true;
 
 // Nếu DEV_MODE = true, dùng response text cứng thay vì gọi Gemini API
 const SIMULATE_GEMINI_RESPONSE = false;
