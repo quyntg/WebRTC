@@ -1,7 +1,9 @@
-/* ====== CẤU HÌNH ====== */
+/* ==================================================================
+   CẤU HÌNH
+================================================================== */
 
 // ⚠️ CHẾ ĐỘ PHÁT TRIỂN: bật để bypass quyền micro và test giao diện
-const DEV_MODE = false;
+const DEV_MODE = true;
 
 // Nếu DEV_MODE = true, dùng response text cứng thay vì gọi Gemini API
 const SIMULATE_GEMINI_RESPONSE = false;
@@ -59,6 +61,7 @@ let connectionDot;
 let connectionLabel;
 let avatarVideo;
 let avatarPlaceholder;
+let remoteAudio;
 let speakingIndicator;
 let faqPanel;
 let transcriptText;
@@ -70,12 +73,14 @@ let currentAvatarState = 'idle'; // 'idle' | 'listening' | 'speaking'
 let isGeminiSpeaking = false; // Track khi Gemini đang nói
 
 // Gemini Live Chat & Audio
+let audioProcessor = null;
 let isUserSpeakingActive = false; // Track nếu đang gửi audio
 let ws = null; // WebSocket connection
 let wsReconnectAttempts = 0;
 let wsReconnectTimer = null;
 let wsIsClosingIntentionally = false; // true khi người dùng chủ động ngắt (endBtn)
 let audioContext = null;
+let audioBuffer = []; // Buffer audio chunks từ Gemini
 
 // FAQ Data
 let faqData = [];
@@ -83,9 +88,36 @@ let isAvatarInCornerMode = false;
 let startListeningBtn;
 let fullscreenBtn;
 
-/* ====== TIỆN ÍCH ====== */
+/* ==================================================================
+   TIỆN ÍCH
+================================================================== */
 function wait(ms) {
 	return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// Load Gemini SDK dynamically if not already loaded
+function loadGeminiSDK() {
+	return new Promise((resolve, reject) => {
+		if (window.GoogleGenerativeAI) {
+			console.log('✓ Gemini SDK đã có sẵn');
+			resolve();
+			return;
+		}
+		
+		console.log('⏳ Load Gemini SDK từ CDN...');
+		const script = document.createElement('script');
+		script.src = 'https://cdn.jsdelivr.net/npm/@google/generative-ai@0.11.4/dist/generative-ai.umd.js';
+		script.async = true;
+		script.onload = () => {
+			console.log('✓ Gemini SDK loaded thành công');
+			resolve();
+		};
+		script.onerror = () => {
+			console.error('❌ Lỗi load Gemini SDK');
+			reject(new Error('Failed to load Gemini SDK'));
+		};
+		document.head.appendChild(script);
+	});
 }
 
 function setConnectionState(state, label) {
@@ -101,7 +133,9 @@ function setConnectionState(state, label) {
 	console.log('  → connectionLabel.textContent sau thay đổi:', connectionLabel.textContent);
 }
 
-/* ====== AVATAR STATE ====== */
+/* ==================================================================
+   QUẢN LÝ TRẠNG THÁI AVATAR (idle, listening, speaking)
+================================================================== */
 function setAvatarState(state) {
 	if (currentAvatarState === state) return; // Không thay đổi nếu trạng thái giống nhau
 	
@@ -151,7 +185,9 @@ function applyFaqState(show) {
 	isAvatarInCornerMode = show;
 }
 
-/* ====== FULLSCREEN ====== */
+/* ==================================================================
+   FULLSCREEN TOGGLE
+================================================================== */
 function toggleFullscreen() {
 	const elem = document.documentElement;
 	const isCurrentlyFullscreen = document.fullscreenElement !== null || 
@@ -186,7 +222,9 @@ function updateFullscreenButtonState() {
 	}
 }
 
-/* ====== GIF FAQ ====== */
+/* ==================================================================
+   PHÁT SEQUENCE GIF FAQ (Chuỗi hình ảnh minh hoạ)
+================================================================== */
 async function playGifSequence(gifList) {
 	console.log('📺 Phát chuỗi GIF FAQ:', gifList);
 	
@@ -200,6 +238,7 @@ async function playGifSequence(gifList) {
 	applyFaqState(true);
 	
 	const faqGifWrap = document.querySelector('.faq-gif-wrap');
+	const faqImg = document.querySelector('.faq-gif') || faqGifWrap.querySelector('img');
 	
 	// Phát từng GIF trong danh sách
 	for (const gifFile of gifList) {
@@ -248,7 +287,9 @@ async function playGifSequence(gifList) {
 	}, 2000);
 }
 
-/* ====== USER SPEAKING DETECTION ====== */
+/* ==================================================================
+   PHÁT HIỆN ÂM THANH NGƯỜI DÙNG (Micro Activity Detection)
+================================================================== */
 function detectUserSpeaking() {
 	// Khi người dùng bắt đầu nói (có audio input)
 	// Chuyển sang trạng thái "listening"
@@ -276,11 +317,23 @@ function stopUserSpeaking() {
 	}
 }
 
-/* ====== SEND TO GEMINI ====== */
+/* ==================================================================
+   GỬI AUDIO/TEXT SANG GEMINI LIVE API
+================================================================== */
 function startSendingAudio() {
 	if (!localMicStream || isUserSpeakingActive) return;
+	
 	isUserSpeakingActive = true;
 	console.log('📤 Bắt đầu gửi audio stream...');
+	
+	// ⚠️ LƯU Ý: Để xử lý audio thực, cần tích hợp Web Speech API
+	// Bây giờ chúng ta sẽ capture text transcript từ audio
+	// và gửi sang Gemini Chat API
+	
+	// TODO: Tích hợp Web Speech API để chuyển audio → text
+	// Hoặc gửi audio binary nếu Gemini API hỗ trợ
+	
+	console.log('ℹ️ Audio streaming có thể yêu cầu backend proxy cho gRPC');
 }
 
 function stopSendingAudio() {
@@ -289,34 +342,354 @@ function stopSendingAudio() {
 	isUserSpeakingActive = false;
 	console.log('📤 Dừng gửi audio stream');
 	
+	if (audioProcessor) {
+		audioProcessor.disconnect();
+		audioProcessor = null;
+	}
 	
 	// 🔴 GỬI TEXT SANG GEMINI CHAT API
 	// Sau khi dừng, gửi user input và nhận response từ Gemini
 	sendMessageToGemini();
 }
 
-/* ====== MESSAGE & RESPONSE ====== */
+/* ==================================================================
+   GỬI MESSAGE SANG GEMINI VÀ NHẬN RESPONSE
+================================================================== */
 async function sendMessageToGemini(userMessage = 'Xin chào') {
 	if (!window.geminiChat) {
 		console.error('❌ Gemini chat chưa khởi tạo');
+		// Ngay lập tức quay về idle thay vì chờ
 		setTimeout(() => setAvatarState('idle'), 500);
 		return;
 	}
 	
 	try {
 		console.log('📤 Gửi message sang Gemini:', userMessage);
+		// Chuyển sang speaking state ngay
 		setAvatarState('speaking');
 		
-		await sendMessageViaFetchAPI(userMessage);
+		// 🔴 KIỂM TRA SIMULATE MODE (DEV_MODE + SIMULATE_GEMINI_RESPONSE)
+		if (SIMULATE_GEMINI_RESPONSE) {
+			console.log('🎭 [SIMULATE] Dùng response text cứng thay vì gọi API');
+			
+			// Danh sách responses mặc định
+			const simulatedResponses = [
+				'Xin chào! Tôi là trợ lý AI của bạn. Có thể tôi giúp gì cho bạn?',
+				'Đây là một bản test luồng. Avatar đang ở trạng thái speaking.',
+				'Hệ thống hoạt động bình thường. Luồng: listening → speaking → idle.',
+				'Thử nói gì đó với tôi xem sao!',
+				'Luồng đã được cập nhật. Avatar sẽ tự chuyển trạng thái.'
+			];
+			
+			// Chọn response random
+			const responseText = simulatedResponses[Math.floor(Math.random() * simulatedResponses.length)];
+			
+			console.log('📥 Response (Simulated):', responseText);
+			transcriptText.textContent = responseText;
+			
+			// 🔴 PHÁT ÂM THANH RESPONSE
+			speakText(responseText);
+			
+			// 🎯 MOCK TOOL CALLING - Ngẫu nhiên trigger FAQ GIF
+			if (Math.random() > 0.5 && faqData.length > 0) {
+				const randomFaq = faqData[Math.floor(Math.random() * faqData.length)];
+				if (randomFaq.gif_sequence && randomFaq.gif_sequence.length > 0) {
+					console.log('🔧 [MOCK] Tool Calling: trigger_faq_gif_sequence');
+					setTimeout(() => playGifSequence(randomFaq.gif_sequence), 1000);
+				}
+			}
+			
+			// Sau khi nói xong, quay về idle (chờ hello.mp3 phát xong ~3s + buffer)
+			setTimeout(() => {
+				console.log('✓ Simulation kết thúc, quay về idle');
+				if (!isAvatarInCornerMode) {
+					setAvatarState('idle');
+				}
+			}, 5000);
+			
+			return; // ⭐ Kết thúc nếu là simulation
+		}
+		
+		// 🔴 KIỂM TRA SỬ DỤNG SDK HAY WEBSOCKET FALLBACK
+		if (window.geminiChat.method === 'websocket') {
+			// Dùng WebSocket
+			console.log('📡 Dùng WebSocket');
+			sendMessageViaWebSocket(userMessage);
+			return;
+		}
+		
+		if (window.geminiChat.method === 'fetch') {
+			// Fallback: dùng REST API trực tiếp
+			console.log('📡 Dùng fetch API (SDK chưa load)');
+			await sendMessageViaFetchAPI(userMessage);
+			return;
+		}
+		
+		// Gửi message qua SDK
+		console.log('Gửi qua SDK');
+		const result = await window.geminiChat.sendMessage(userMessage);
+		const response = await result.response;
+		const responseText = response.text();
+		
+		console.log('📥 Response từ Gemini:', responseText);
+		transcriptText.textContent = responseText;
+		
+		// 🔴 KIỂM TRA TOOL CALLING (Nếu Gemini gọi hàm trigger_faq_gif_sequence)
+		if (response.functionCalls && response.functionCalls.length > 0) {
+			const faqCall = response.functionCalls.find(c => c.name === 'trigger_faq_gif_sequence');
+			if (faqCall && faqCall.args.gif_list) {
+				console.log('🔧 Tool Calling detected: trigger_faq_gif_sequence');
+				playGifSequence(faqCall.args.gif_list);
+			}
+		}
+		
+		// 🔴 PHÁT ÂM THANH RESPONSE (cần Text-to-Speech)
+		speakText(responseText);
+		
+		// ⭐ Không cần setTimeout nữa - onend callback sẽ quay về idle
 		
 	} catch (err) {
 		console.error('❌ Lỗi gửi message:', err);
 		transcriptText.textContent = 'Lỗi: ' + err.message;
-		setTimeout(() => setAvatarState('idle'), 2000);
+		// Quay về idle sau 2s
+		setTimeout(() => {
+			setAvatarState('idle');
+		}, 2000);
 	}
 }
 
-/* ====== FETCH API ====== */
+/* ==================================================================
+   GEMINI LIVE WebSocket: GỬI MESSAGE & NHẬN AUDIO RESPONSE
+================================================================== */
+function buildGeminiWebSocketUrl() {
+    const apiKey = window.GEMINI_API_KEY;  // ← Đọc trực tiếp từ window
+    if (!apiKey) {
+        throw new Error('Thiếu GEMINI_API_KEY (kiểm tra env-config.js)');
+    }
+    return `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key=${apiKey}`;
+}
+
+function sendSetupMessage(socket) {
+	const faqContext = faqData.map(faq => ({
+		question: faq.question,
+		answer: faq.answer,
+		gif_sequence: faq.gif_sequence
+	}));
+
+	const setupMsg = {
+		setup: {
+			model: "models/gemini-3.6-flash",
+			generationConfig: {
+				responseModalities: ["AUDIO"]
+			},
+			systemInstruction: {
+				parts: [{
+					text: `Bạn là Trợ lý Lễ tân ảo. Dưới đây là dữ liệu FAQ chính thức:\n${JSON.stringify(faqContext)}\n\nQUY TẮC:\n1. Trả lời khéo léo dựa trên FAQ.\n2. Nếu câu hỏi của người dùng trùng khớp FAQ nào có 'gif_sequence', BẮT BUỘC gọi hàm trigger_faq_gif_sequence cùng lúc trả lời.\n3. Nếu câu hỏi ngoài FAQ, hãy từ chối lịch sự và KHÔNG gọi hàm.\n4. Luôn trả lời bằng Tiếng Việt.`
+				}]
+			}
+		}
+	};
+
+	vlog('📤 Gửi setup message:', setupMsg);
+	socket.send(JSON.stringify(setupMsg));
+}
+
+function handleGeminiSocketMessage(event) {
+	vlog('📨 Nhận message từ WebSocket:', event.data.substring(0, 200));
+	let data;
+	try {
+		data = JSON.parse(event.data);
+	} catch (err) {
+		console.error('❌ Không parse được message từ WebSocket:', err);
+		return;
+	}
+
+	// 🔴 NHẬN AUDIO CHUNK TỪ GEMINI
+	if (data.serverContent?.modelTurn?.parts) {
+		setAvatarState('speaking');
+
+		for (const part of data.serverContent.modelTurn.parts) {
+			if (part.inlineData?.mimeType?.includes('audio')) {
+				playAudioChunk(part.inlineData.data);
+			}
+			if (part.text) {
+				transcriptText.textContent = part.text;
+			}
+		}
+	}
+
+	// 🔴 NHẬN TÍN HIỆU GỌI HÀM TOOL CALLING
+	if (data.toolCall) {
+		const call = data.toolCall.functionCalls?.find(c => c.name === "trigger_faq_gif_sequence");
+		if (call && call.args?.gif_list) {
+			console.log('📺 Trigger FAQ GIF:', call.args.gif_list);
+			playGifSequence(call.args.gif_list);
+		}
+	}
+
+	// 🔴 KHI AI KẾT THÚC CÂU NÓI
+	if (data.serverContent?.turnComplete) {
+		setTimeout(() => {
+			if (!isAvatarInCornerMode) {
+				setAvatarState('idle');
+			}
+		}, 1000);
+	}
+}
+
+// Đóng WebSocket một cách chủ động (người dùng bấm "Kết thúc cuộc gọi",
+// hoặc khi ta muốn mở lại kết nối mới). Đặt cờ này để onclose không
+// tự động reconnect.
+function closeGeminiLiveWebSocket() {
+	wsIsClosingIntentionally = true;
+	clearTimeout(wsReconnectTimer);
+	wsReconnectTimer = null;
+	wsReconnectAttempts = 0;
+	if (ws) {
+		ws.onopen = null;
+		ws.onmessage = null;
+		ws.onerror = null;
+		ws.onclose = null;
+		if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+			ws.close();
+		}
+		ws = null;
+	}
+}
+
+// Thử kết nối lại với backoff tăng dần (1s, 2s, 4s... tối đa maxDelayMs)
+function scheduleGeminiReconnect() {
+	if (wsIsClosingIntentionally) return;
+	if (wsReconnectAttempts >= WS_RECONNECT_CONFIG.maxAttempts) {
+		console.error('❌ Đã thử reconnect quá số lần cho phép, dừng lại');
+		setConnectionState('error', 'Mất kết nối, vui lòng thử lại');
+		return;
+	}
+
+	wsReconnectAttempts += 1;
+	const delay = Math.min(
+		WS_RECONNECT_CONFIG.baseDelayMs * 2 ** (wsReconnectAttempts - 1),
+		WS_RECONNECT_CONFIG.maxDelayMs
+	);
+
+	console.warn(`⚠️ WebSocket rớt, thử kết nối lại lần ${wsReconnectAttempts}/${WS_RECONNECT_CONFIG.maxAttempts} sau ${delay}ms`);
+	setConnectionState('connecting', 'Mất kết nối, đang thử lại...');
+
+	wsReconnectTimer = setTimeout(() => {
+		initGeminiLiveWebSocket();
+	}, delay);
+}
+
+function initGeminiLiveWebSocket() {
+	try {
+		console.log('📡 Khởi tạo Gemini Live WebSocket...');
+		wsIsClosingIntentionally = false;
+
+		const wsUrl = buildGeminiWebSocketUrl();
+		const socket = new WebSocket(wsUrl);
+		ws = socket;
+
+		socket.onopen = () => {
+			// Kết nối thành công → reset bộ đếm reconnect
+			wsReconnectAttempts = 0;
+			console.log('✓ WebSocket kết nối thành công');
+			setConnectionState('connected', 'Đã kết nối');
+			sendSetupMessage(socket);
+		};
+
+		socket.onmessage = handleGeminiSocketMessage;
+
+		socket.onerror = (err) => {
+			console.error('❌ WebSocket error:', err);
+			transcriptText.textContent = 'Lỗi kết nối WebSocket, đang thử kết nối lại...';
+			// Không set ws = null hay reconnect ở đây: sự kiện onclose sẽ
+			// luôn được trình duyệt gọi ngay sau onerror, ta xử lý reconnect ở đó.
+		};
+
+		// Đặt tên tham số rõ ràng (event), tránh phụ thuộc biến window.event
+		// toàn cục vốn không đáng tin cậy và có thể undefined.
+		socket.onclose = (event) => {
+			console.log(`⚠️ WebSocket đóng (code: ${event.code}, reason: ${event.reason || 'không rõ'})`);
+			ws = null;
+			setAvatarState('idle');
+
+			if (!wsIsClosingIntentionally) {
+				setConnectionState('error', 'Mất kết nối');
+				scheduleGeminiReconnect();
+			}
+		};
+
+		return true;
+	} catch (err) {
+		console.error('❌ Lỗi init WebSocket:', err);
+		return false;
+	}
+}
+
+// 🔴 PHÁT AUDIO CHUNK TỪ GEMINI (base64 → AudioContext)
+function playAudioChunk(base64Audio) {
+	try {
+		if (!audioContext) {
+			audioContext = new (window.AudioContext || window.webkitAudioContext)();
+		}
+		
+		// Decode base64 thành binary
+		const binaryString = atob(base64Audio);
+		const bytes = new Uint8Array(binaryString.length);
+		for (let i = 0; i < binaryString.length; i++) {
+			bytes[i] = binaryString.charCodeAt(i);
+		}
+		
+		// Decode WAV/MP3 audio
+		audioContext.decodeAudioData(
+			bytes.buffer,
+			(decodedData) => {
+				const source = audioContext.createBufferSource();
+				source.buffer = decodedData;
+				source.connect(audioContext.destination);
+				source.start();
+				console.log('🔊 Phát audio chunk');
+			},
+			(err) => {
+				console.error('❌ Decode audio error:', err);
+			}
+		);
+	} catch (err) {
+		console.error('❌ Play audio chunk error:', err);
+	}
+}
+
+// 🔴 GỬI MESSAGE SANG GEMINI LIVE QUA WebSocket
+function sendMessageViaWebSocket(userMessage) {
+	if (!ws || ws.readyState !== WebSocket.OPEN) {
+		console.error('❌ WebSocket chưa kết nối');
+		setAvatarState('idle');
+		return;
+	}
+	
+	try {
+		const clientMsg = {
+			clientContent: {
+				turns: [{
+					parts: [{
+						text: userMessage
+					}]
+				}],
+				turnComplete: true
+			}
+		};
+		
+		console.log('📤 Gửi message via WebSocket:', userMessage);
+		ws.send(JSON.stringify(clientMsg));
+	} catch (err) {
+		console.error('❌ Lỗi gửi message via WebSocket:', err);
+		setAvatarState('idle');
+	}
+}
+
+/* ==================================================================
+   FALLBACK: GỬI MESSAGE QUA FETCH API TRỰC TIẾP
+================================================================== */
 async function sendMessageViaFetchAPI(userMessage) {
 	try {
 		console.log('📡 Gửi request tới Gemini API (Fetch fallback)...');
@@ -428,7 +801,9 @@ QUY TẮC:
 	}
 }
 
-/* ====== PLAY AUDIO ====== */
+/* ==================================================================
+   PHÁT ÂM THANH AUDIO FILE (hello.mp3)
+================================================================== */
 function playHelloAudio() {
 	console.log('🎵 Phát hello.mp3...');
 	
@@ -450,7 +825,9 @@ function playHelloAudio() {
 	};
 }
 
-/* ====== TEXT-TO-SPEECH ====== */
+/* ==================================================================
+   TEXT-TO-SPEECH: PHÁT NÓI TỪ TEXT
+================================================================== */
 function speakText(text) {
 	// 🔴 SIMULATE MODE: Phát hello.mp3 thay vì TTS
 	if (SIMULATE_GEMINI_RESPONSE) {
@@ -495,15 +872,50 @@ function speakText(text) {
 	window.speechSynthesis.speak(utterance);
 }
 
+/* ==================================================================
+   HELPER: CHUYỂN ĐỔI AUDIO DATA SANG PCM 16-BIT
+   ⚠️ Dành cho tương lai khi tích hợp WebSocket/gRPC audio streaming
+================================================================== */
+function convertToPCM16(audioData) {
+	const pcm16 = new Int16Array(audioData.length);
+	for (let i = 0; i < audioData.length; i++) {
+		pcm16[i] = Math.max(-1, Math.min(1, audioData[i])) * 0x7FFF;
+	}
+	return pcm16.buffer;
+}
 
+/* ==================================================================
+   PHÁT ÂM THANH (dùng Text-to-Speech hoặc Web Audio API)
+================================================================== */
+function playAudioBuffer(audioBuffer) {
+	// Nếu có audio buffer real từ Gemini
+	// Phát nó qua Web Audio API
+	
+	try {
+		const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+		audioContext.decodeAudioData(audioBuffer, (decodedData) => {
+			const source = audioContext.createBufferSource();
+			source.buffer = decodedData;
+			source.connect(audioContext.destination);
+			source.start();
+		}, (err) => {
+			console.error('Lỗi decode audio:', err);
+		});
+	} catch (err) {
+		console.error('Lỗi phát audio:', err);
+	}
+}
 
-/* ====== CONNECT GEMINI ====== */
+/* ==================================================================
+   TÍCH HỢP GEMINI LIVE API (REST API Streaming)
+================================================================== */
 async function connectGeminiLiveSocket() {
 	console.log('  → connectGeminiLiveSocket bắt đầu...');
 	const delay = DEV_MODE ? 300 : 600;
 	await wait(delay);
+	console.log('  → connectGeminiLiveSocket hoàn tát');
 	
-	// Tải dữ liệu FAQ
+	// 🔴 TẢI DỮ LIỆU FAQ
 	try {
 		const faqResponse = await fetch('./data/faq.json');
 		faqData = await faqResponse.json();
@@ -513,25 +925,78 @@ async function connectGeminiLiveSocket() {
 		faqData = [];
 	}
 	
-	// Trong DEV_MODE hoặc SIMULATE_MODE: dùng fetch API (không cần API key)
-	if (DEV_MODE || SIMULATE_GEMINI_RESPONSE) {
-		console.log('🔧 Dev/Simulate mode: dùng Fetch API');
-		window.geminiChat = { method: 'fetch' };
-	} else {
-		// Production: kiểm tra API key
-		if (!window.GEMINI_API_KEY) {
-			throw new Error('API key not found in window.GEMINI_API_KEY');
-		}
-		console.log('✓ API key đã load');
-		window.geminiChat = { method: 'fetch', apiKey: GEMINI_LIVE_CONFIG.apiKey };
+	// 🔴 KIỂM TRA SIMULATE MODE
+	if (SIMULATE_GEMINI_RESPONSE) {
+		console.log('🎭 [SIMULATE MODE] Bỏ qua khởi tạo Gemini API');
+		console.log('   Sẽ dùng response text cứng thay vì gọi API');
+		window.geminiChat = { method: 'simulate' }; // Placeholder
+		setAvatarState('idle');
+		transcriptText.textContent = 'Kết nối thành công. Bạn có thể bắt đầu nói.';
+		console.log('  → transcriptText.textContent mới:', transcriptText.textContent);
+		return;
 	}
 	
+	// 🔴 KIỂM TRA DEV MODE
+	if (DEV_MODE) {
+		console.log('🔧 [DEV MODE] Bỏ qua khởi tạo Gemini API');
+		console.log('   Sẽ dùng phím tắt để test luồng');
+		window.geminiChat = { method: 'simulate' }; // Placeholder
+		setAvatarState('idle');
+		transcriptText.textContent = 'Kết nối thành công. Bạn có thể bắt đầu nói.';
+		console.log('  → transcriptText.textContent mới:', transcriptText.textContent);
+		return;
+	}
+	
+	// 🔴 CHECK API KEY (chỉ cần khi dùng real API)
+	if (!window.GEMINI_API_KEY) {
+		console.error('❌ API key không được set! Kiểm tra env-config.js');
+		console.log('   window.GEMINI_API_KEY:', window.GEMINI_API_KEY);
+		throw new Error('API key not found in window.GEMINI_API_KEY');
+	}
+	console.log('✓ API key đã load');
+	
+	// 🔴 SKIP WebSocket - v1alpha không hỗ trợ models, dùng REST API trực tiếp
+	console.warn('⚠️ WebSocket v1alpha không hỗ trợ models, sử dụng REST API (Fetch) trực tiếp');
+	window.geminiChat = { method: 'fetch', apiKey: GEMINI_LIVE_CONFIG.apiKey };
 	console.log('✓ Sẵn sàng dùng Fetch API');
+	
+	// Thiết lập trạng thái avatar mặc định là idle
 	setAvatarState('idle');
 	transcriptText.textContent = 'Kết nối thành công. Bạn có thể bắt đầu nói.';
+	console.log('  → transcriptText.textContent mới:', transcriptText.textContent);
 }
 
-/* ====== START BUTTON ====== */
+/* ==================================================================
+   MÔ PHỎNG: PHÁT HIỆN GEMINI NÓI (test visual state + phát audio)
+================================================================== */
+function simulateGeminiSpeaking(duration = 5000) {
+	// Hàm này dùng để test visual state: mô phỏng avatar speaking
+	// ⚠️ THAY ĐỔI VISUAL STATE + PHÁT AUDIO
+	console.log('🔴 [DEV] Mô phỏng Gemini bắt đầu nói (visual + audio)...');
+	setAvatarState('speaking');
+	
+	// Phát audio test
+	const testMessage = 'Xin chào, đây là test phím S.';
+	speakText(testMessage);
+	
+	// Nếu FAQ được bật, giữ FAQ panel mở
+	if (isFaqVisible) {
+		console.log('📺 Hiển thị FAQ GIF trong khi Gemini nói');
+		applyFaqState(true);
+	}
+	
+	// Sau khoảng thời gian, quay về idle
+	setTimeout(() => {
+		if (isGeminiSpeaking) {
+			console.log('🔴 [DEV] Mô phỏng Gemini nói xong...');
+			setAvatarState('idle');
+		}
+	}, duration);
+}
+
+/* ==================================================================
+   XỬ LÝ NÚT "BẮT ĐẦU"
+================================================================== */
 async function handleStartClick() {
 	startBtn.disabled = true;
 	startBtn.textContent = DEV_MODE ? 'Đang vào chế độ dev...' : 'Đang xin quyền micro...';
@@ -613,12 +1078,15 @@ async function handleStartClick() {
 	}
 }
 
-/* ====== VOLUME DETECTION ====== */
+/* ==================================================================
+   PHÁT HIỆN ÂM THANH TỪ MICRO (Volume Detection)
+================================================================== */
 let silenceTimeout = null;
 let volumeDetectionAnimationId = null;
+let analyserNode = null;
 let maxListeningTimeout = null;
 const SILENCE_THRESHOLD = 2000; // ms - chờ 2 giây im lặng mới gửi
-const MAX_LISTENING_DURATION = 30000; // 30 giây - nếu nghe quá lâu sẽ tự động gửi
+const MAX_LISTENING_DURATION = 5000; // 5 giây - nếu nghe quá lâu sẽ tự động gửi
 
 function setupMicVolumeDetection() {
 	if (!localMicStream) return;
@@ -629,7 +1097,7 @@ function setupMicVolumeDetection() {
 	
 	microphone.connect(analyser);
 	analyser.fftSize = 256;
-	
+	analyserNode = analyser;
 	
 	const dataArray = new Uint8Array(analyser.frequencyBinCount);
 	const VOLUME_THRESHOLD = 80; // 🔴 Tăng từ 30 lên 80 - threshold cao hơn để tránh ambient noise
@@ -701,19 +1169,27 @@ function resetMicVolumeDetection() {
 	}
 }
 
-/* ====== DEV MODE SHORTCUTS ====== */
+/* ==================================================================
+   PHÍM TẮT DEV MODE (Test simulation)
+================================================================== */
 function setupDevModeShortcuts() {
 	document.addEventListener('keydown', (e) => {
 		// L: mô phỏng người dùng nói
 		if (e.key === 'l' || e.key === 'L') {
-			console.log('🔑 [DEV] Phím L: listening state');
+			console.log('🔑 [DEV] Phím L: mô phỏng listening (avatar only, no audio)');
 			detectUserSpeaking();
 		}
 		
-		// K: dừng nói + gửi message
+		// K: mô phỏng dừng nói + gửi message test
 		if (e.key === 'k' || e.key === 'K') {
-			console.log('🔑 [DEV] Phím K: stop + send message');
+			console.log('🔑 [DEV] Phím K: mô phỏng stop + gửi message test (WITH AUDIO)');
 			stopUserSpeaking();
+		}
+		
+		// S: test visual speaking state + phát audio
+		if (e.key === 's' || e.key === 'S') {
+			console.log('🔑 [DEV] Phím S: test speaking visual (avatar + AUDIO)');
+			simulateGeminiSpeaking(5000);
 		}
 		
 		// G: toggle FAQ
@@ -723,9 +1199,9 @@ function setupDevModeShortcuts() {
 			applyFaqState(isFaqVisible);
 		}
 		
-		// M: gửi message test
+		// M: gửi message test trực tiếp (WITH AUDIO)
 		if (e.key === 'm' || e.key === 'M') {
-			console.log('🔑 [DEV] Phím M: send test message');
+			console.log('🔑 [DEV] Phím M: gửi message test (WITH AUDIO)');
 			if (window.geminiChat) {
 				sendMessageToGemini('Cho tôi biết đây là gì?');
 			}
@@ -733,7 +1209,9 @@ function setupDevModeShortcuts() {
 	});
 }
 
-/* ====== EVENT LISTENERS ====== */
+/* ==================================================================
+   GẮN EVENT LISTENERS
+================================================================== */
 function attachEventListeners() {
 	console.log('✓ Gắn event listeners...');
 
@@ -785,9 +1263,13 @@ function attachEventListeners() {
 
 	// KẾT THÚC CUỘC GỌI
 	endBtn.addEventListener('click', () => {
+		// Dừng gửi audio
 		stopSendingAudio();
+
+		// Đóng WebSocket chủ động (không để onclose tự động reconnect)
+		closeGeminiLiveWebSocket();
 		
-		// Dừng Text-to-Speech
+		// Dừng Text-to-Speech nếu đang phát
 		if (window.speechSynthesis) {
 			window.speechSynthesis.cancel();
 		}
@@ -796,12 +1278,14 @@ function attachEventListeners() {
 		if (localMicStream) {
 			localMicStream.getTracks().forEach(track => track.stop());
 		}
-		
-		// Reset state
 		localMicStream = null;
+		avatarVideo.srcObject = null;
+		remoteAudio.srcObject = null;
 		avatarPlaceholder.style.display = 'flex';
 		applyFaqState(false);
 		setConnectionState('idle', 'Đã ngắt kết nối');
+		
+		// Reset trạng thái
 		currentAvatarState = 'idle';
 		isGeminiSpeaking = false;
 		isFaqVisible = false;
@@ -817,7 +1301,9 @@ function attachEventListeners() {
 	});
 }
 
-/* ====== INITIALIZATION ====== */
+/* ==================================================================
+   KHỞI TẠO KHI DOM LOAD XONG
+================================================================== */
 document.addEventListener('DOMContentLoaded', () => {
 	console.log('📄 DOMContentLoaded: Bắt đầu khởi tạo...');
 
@@ -839,6 +1325,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
 	avatarVideo = document.getElementById('avatarVideo');
 	avatarPlaceholder = document.getElementById('avatarPlaceholder');
+	remoteAudio = document.getElementById('remoteAudio');
 	speakingIndicator = document.getElementById('speakingIndicator');
 	faqPanel = document.getElementById('faqPanel');
 	transcriptText = document.getElementById('transcriptText');
@@ -848,7 +1335,7 @@ document.addEventListener('DOMContentLoaded', () => {
 	const elements = {
 		welcomeScreen, appScreen, startBtn, transcriptText, stage, 
 		toggleFaqBtn, micBtn, micLabel, endBtn, connectionDot, 
-		connectionLabel, avatarVideo, avatarPlaceholder,
+		connectionLabel, avatarVideo, avatarPlaceholder, remoteAudio,
 		speakingIndicator, faqPanel, permissionError, fullscreenBtn
 	};
 
@@ -870,7 +1357,9 @@ document.addEventListener('DOMContentLoaded', () => {
 	console.log('✓ Khởi tạo hoàn tát');
 });
 
-/* ====== ENVIRONMENT NOTES ====== */
+/* ==================================================================
+   GHI CHÚ MÔI TRƯỜNG
+================================================================== */
 if (location.protocol !== 'https:' && location.hostname !== 'localhost' && location.hostname !== '127.0.0.1') {
 	console.warn('Cảnh báo: trang này cần chạy trên HTTPS hoặc localhost để Micro và WebRTC hoạt động.');
 }
