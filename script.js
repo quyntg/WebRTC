@@ -22,12 +22,30 @@ const GEMINI_LIVE_CONFIG = {
 	// 🔴 CẤU HÌNH GEMINI LIVE API
 	// Lấy từ: https://ai.google.dev/
 	// API key được load từ env-config.js
+	// ⚠️ CẢNH BÁO BẢO MẬT: key này chạy ở client nên bất kỳ ai mở DevTools
+	// cũng lấy được. Với môi trường production nên đổi sang ephemeral token
+	// (Gemini Live hỗ trợ) hoặc proxy WebSocket qua backend của bạn.
 	apiKey: window.GEMINI_API_KEY,
 	
 	// gemini-3.6-flash hỗ trợ WebSocket bidirectional
 	model: 'gemini-3.6-flash',
 	temperature: 0.7
 };
+
+// Cấu hình kết nối lại (reconnect) khi WebSocket rớt mạng
+const WS_RECONNECT_CONFIG = {
+	maxAttempts: 5,
+	baseDelayMs: 1000,   // độ trễ lần thử đầu tiên
+	maxDelayMs: 15000,   // trần độ trễ giữa các lần thử
+	connectTimeoutMs: 10000 // tối đa chờ WebSocket mở trước khi coi là timeout
+};
+
+// Bật để in log chi tiết (volume, message payload...). Tắt khi lên production
+// để console đỡ rác.
+const VERBOSE_LOGGING = false;
+function vlog(...args) {
+	if (VERBOSE_LOGGING) console.log(...args);
+}
 
 // Biến toàn cục
 let welcomeScreen;
@@ -58,6 +76,9 @@ let isGeminiSpeaking = false; // Track khi Gemini đang nói
 let audioProcessor = null;
 let isUserSpeakingActive = false; // Track nếu đang gửi audio
 let ws = null; // WebSocket connection
+let wsReconnectAttempts = 0;
+let wsReconnectTimer = null;
+let wsIsClosingIntentionally = false; // true khi người dùng chủ động ngắt (endBtn)
 let audioContext = null;
 let audioBuffer = []; // Buffer audio chunks từ Gemini
 
@@ -403,105 +424,166 @@ async function sendMessageToGemini(userMessage = 'Xin chào') {
 /* ==================================================================
    GEMINI LIVE WebSocket: GỬI MESSAGE & NHẬN AUDIO RESPONSE
 ================================================================== */
+function buildGeminiWebSocketUrl() {
+	const apiKey = GEMINI_LIVE_CONFIG.apiKey;
+	if (!apiKey) {
+		throw new Error('Thiếu GEMINI_API_KEY (kiểm tra env-config.js)');
+	}
+	// Live API chỉ chạy qua wss:// (không có biến thể ws:// cho localhost),
+	// nên không cần nhánh chọn protocol theo location.protocol.
+	return `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key=${apiKey}`;
+}
+
+function sendSetupMessage(socket) {
+	const faqContext = faqData.map(faq => ({
+		question: faq.question,
+		answer: faq.answer,
+		gif_sequence: faq.gif_sequence
+	}));
+
+	const setupMsg = {
+		setup: {
+			model: "models/gemini-3.6-flash",
+			generationConfig: {
+				responseModalities: ["AUDIO"]
+			},
+			systemInstruction: {
+				parts: [{
+					text: `Bạn là Trợ lý Lễ tân ảo. Dưới đây là dữ liệu FAQ chính thức:\n${JSON.stringify(faqContext)}\n\nQUY TẮC:\n1. Trả lời khéo léo dựa trên FAQ.\n2. Nếu câu hỏi của người dùng trùng khớp FAQ nào có 'gif_sequence', BẮT BUỘC gọi hàm trigger_faq_gif_sequence cùng lúc trả lời.\n3. Nếu câu hỏi ngoài FAQ, hãy từ chối lịch sự và KHÔNG gọi hàm.\n4. Luôn trả lời bằng Tiếng Việt.`
+				}]
+			}
+		}
+	};
+
+	vlog('📤 Gửi setup message:', setupMsg);
+	socket.send(JSON.stringify(setupMsg));
+}
+
+function handleGeminiSocketMessage(event) {
+	vlog('📨 Nhận message từ WebSocket:', event.data.substring(0, 200));
+	let data;
+	try {
+		data = JSON.parse(event.data);
+	} catch (err) {
+		console.error('❌ Không parse được message từ WebSocket:', err);
+		return;
+	}
+
+	// 🔴 NHẬN AUDIO CHUNK TỪ GEMINI
+	if (data.serverContent?.modelTurn?.parts) {
+		setAvatarState('speaking');
+
+		for (const part of data.serverContent.modelTurn.parts) {
+			if (part.inlineData?.mimeType?.includes('audio')) {
+				playAudioChunk(part.inlineData.data);
+			}
+			if (part.text) {
+				transcriptText.textContent = part.text;
+			}
+		}
+	}
+
+	// 🔴 NHẬN TÍN HIỆU GỌI HÀM TOOL CALLING
+	if (data.toolCall) {
+		const call = data.toolCall.functionCalls?.find(c => c.name === "trigger_faq_gif_sequence");
+		if (call && call.args?.gif_list) {
+			console.log('📺 Trigger FAQ GIF:', call.args.gif_list);
+			playGifSequence(call.args.gif_list);
+		}
+	}
+
+	// 🔴 KHI AI KẾT THÚC CÂU NÓI
+	if (data.serverContent?.turnComplete) {
+		setTimeout(() => {
+			if (!isAvatarInCornerMode) {
+				setAvatarState('idle');
+			}
+		}, 1000);
+	}
+}
+
+// Đóng WebSocket một cách chủ động (người dùng bấm "Kết thúc cuộc gọi",
+// hoặc khi ta muốn mở lại kết nối mới). Đặt cờ này để onclose không
+// tự động reconnect.
+function closeGeminiLiveWebSocket() {
+	wsIsClosingIntentionally = true;
+	clearTimeout(wsReconnectTimer);
+	wsReconnectTimer = null;
+	wsReconnectAttempts = 0;
+	if (ws) {
+		ws.onopen = null;
+		ws.onmessage = null;
+		ws.onerror = null;
+		ws.onclose = null;
+		if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+			ws.close();
+		}
+		ws = null;
+	}
+}
+
+// Thử kết nối lại với backoff tăng dần (1s, 2s, 4s... tối đa maxDelayMs)
+function scheduleGeminiReconnect() {
+	if (wsIsClosingIntentionally) return;
+	if (wsReconnectAttempts >= WS_RECONNECT_CONFIG.maxAttempts) {
+		console.error('❌ Đã thử reconnect quá số lần cho phép, dừng lại');
+		setConnectionState('error', 'Mất kết nối, vui lòng thử lại');
+		return;
+	}
+
+	wsReconnectAttempts += 1;
+	const delay = Math.min(
+		WS_RECONNECT_CONFIG.baseDelayMs * 2 ** (wsReconnectAttempts - 1),
+		WS_RECONNECT_CONFIG.maxDelayMs
+	);
+
+	console.warn(`⚠️ WebSocket rớt, thử kết nối lại lần ${wsReconnectAttempts}/${WS_RECONNECT_CONFIG.maxAttempts} sau ${delay}ms`);
+	setConnectionState('connecting', 'Mất kết nối, đang thử lại...');
+
+	wsReconnectTimer = setTimeout(() => {
+		initGeminiLiveWebSocket();
+	}, delay);
+}
+
 function initGeminiLiveWebSocket() {
 	try {
 		console.log('📡 Khởi tạo Gemini Live WebSocket...');
-		
-		// Xây dựng WebSocket URL (nó sẽ chuyển từ http → ws)
-		let wsProtocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-		const apiKey = GEMINI_LIVE_CONFIG.apiKey;
-		
-		// Sử dụng ws:// cho localhost, wss:// cho production
-		const wsUrl = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key=${apiKey}`;
-		
-		ws = new WebSocket(wsUrl);
-		
-		ws.onopen = () => {
+		wsIsClosingIntentionally = false;
+
+		const wsUrl = buildGeminiWebSocketUrl();
+		const socket = new WebSocket(wsUrl);
+		ws = socket;
+
+		socket.onopen = () => {
+			// Kết nối thành công → reset bộ đếm reconnect
+			wsReconnectAttempts = 0;
 			console.log('✓ WebSocket kết nối thành công');
-			
-			// Gửi gói Setup nạp FAQ & Tool Calling
-			const faqContext = faqData.map(faq => ({
-				question: faq.question,
-				answer: faq.answer,
-				gif_sequence: faq.gif_sequence
-			}));
-			
-			const setupMsg = {
-				setup: {
-					model: "models/gemini-3.6-flash",
-					generationConfig: {
-						responseModalities: ["AUDIO"]
-					},
-					systemInstruction: {
-						parts: [{
-							text: `Bạn là Trợ lý Lễ tân ảo. Dưới đây là dữ liệu FAQ chính thức:\n${JSON.stringify(faqContext)}\n\nQUY TẮC:\n1. Trả lời khéo léo dựa trên FAQ.\n2. Nếu câu hỏi của người dùng trùng khớp FAQ nào có 'gif_sequence', BẮT BUỘC gọi hàm trigger_faq_gif_sequence cùng lúc trả lời.\n3. Nếu câu hỏi ngoài FAQ, hãy từ chối lịch sự và KHÔNG gọi hàm.\n4. Luôn trả lời bằng Tiếng Việt.`
-						}]
-					}
-				}
-			};
-			
-			console.log('📤 Gửi setup message...');
-			console.log('🔍 Setup message:', JSON.stringify(setupMsg, null, 2));
-			ws.send(JSON.stringify(setupMsg));
+			setConnectionState('connected', 'Đã kết nối');
+			sendSetupMessage(socket);
 		};
-		
-		ws.onmessage = (event) => {
-			console.log('📨 Nhận message từ WebSocket:', event.data.substring(0, 200));
-			const data = JSON.parse(event.data);
-			
-			// 🔴 NHẬN AUDIO CHUNK TỪ GEMINI
-			if (data.serverContent?.modelTurn?.parts) {
-				setAvatarState('speaking');
-				
-				for (const part of data.serverContent.modelTurn.parts) {
-					// Nhận audio chunk (base64 encoded)
-					if (part.inlineData?.mimeType?.includes('audio')) {
-						console.log('🔊 Nhận audio chunk từ Gemini');
-						playAudioChunk(part.inlineData.data);
-					}
-					
-					// Nhận text response
-					if (part.text) {
-						console.log('📝 Response text:', part.text);
-						transcriptText.textContent = part.text;
-					}
-				}
-			}
-			
-			// 🔴 NHẬN TÍN HIỆU GỌI HÀM TOOL CALLING
-			if (data.toolCall) {
-				console.log('🔧 Tool Call received:', data.toolCall);
-				const call = data.toolCall.functionCalls?.find(c => c.name === "trigger_faq_gif_sequence");
-				if (call && call.args?.gif_list) {
-					console.log('📺 Trigger FAQ GIF:', call.args.gif_list);
-					playGifSequence(call.args.gif_list);
-				}
-			}
-			
-			// 🔴 KHI AI KẾT THÚC CÂU NÓI
-			if (data.serverContent?.turnComplete) {
-				console.log('✓ Gemini kết thúc, quay về idle');
-				setTimeout(() => {
-					if (!isAvatarInCornerMode) {
-						setAvatarState('idle');
-					}
-				}, 1000);
-			}
-		};
-		
-		ws.onerror = (err) => {
+
+		socket.onmessage = handleGeminiSocketMessage;
+
+		socket.onerror = (err) => {
 			console.error('❌ WebSocket error:', err);
-			console.error('❌ Error details:', JSON.stringify(err, Object.getOwnPropertyNames(err)));
-			setAvatarState('idle');
-			transcriptText.textContent = 'Lỗi kết nối WebSocket: ' + (err.message || 'Unknown error');
+			transcriptText.textContent = 'Lỗi kết nối WebSocket, đang thử kết nối lại...';
+			// Không set ws = null hay reconnect ở đây: sự kiện onclose sẽ
+			// luôn được trình duyệt gọi ngay sau onerror, ta xử lý reconnect ở đó.
 		};
-		
-		ws.onclose = () => {
-			console.log('⚠️ WebSocket đóng');
-			console.log('⚠️ Close code:', event?.code, 'Reason:', event?.reason);
+
+		// Đặt tên tham số rõ ràng (event), tránh phụ thuộc biến window.event
+		// toàn cục vốn không đáng tin cậy và có thể undefined.
+		socket.onclose = (event) => {
+			console.log(`⚠️ WebSocket đóng (code: ${event.code}, reason: ${event.reason || 'không rõ'})`);
 			ws = null;
+			setAvatarState('idle');
+
+			if (!wsIsClosingIntentionally) {
+				setConnectionState('error', 'Mất kết nối');
+				scheduleGeminiReconnect();
+			}
 		};
-		
+
 		return true;
 	} catch (err) {
 		console.error('❌ Lỗi init WebSocket:', err);
@@ -822,33 +904,39 @@ async function connectGeminiLiveSocket() {
 	
 	// 🔴 KHỞI TẠO GEMINI LIVE CLIENT (WebSocket)
 	try {
-		// Khởi tạo WebSocket
 		const wsSuccess = initGeminiLiveWebSocket();
-		
-		if (wsSuccess) {
-			// Chờ WebSocket ready
-			await new Promise((resolve) => {
-				const checkReady = () => {
-					if (ws && ws.readyState === WebSocket.OPEN) {
-						console.log('✓ WebSocket ready');
-						resolve();
-					} else {
-						setTimeout(checkReady, 100);
-					}
-				};
-				checkReady();
-			});
-			
-			window.geminiChat = { method: 'websocket', ws: ws };
-			console.log('✓ Gemini Live WebSocket session khởi tạo thành công');
-		} else {
+		if (!wsSuccess) {
 			throw new Error('Failed to init WebSocket');
 		}
-		
+
+		// Chờ WebSocket mở, có timeout để không treo vô hạn nếu server
+		// không phản hồi và cũng không bắn onerror.
+		await new Promise((resolve, reject) => {
+			const timeoutId = setTimeout(() => {
+				reject(new Error('Timeout khi chờ WebSocket kết nối'));
+			}, WS_RECONNECT_CONFIG.connectTimeoutMs);
+
+			const checkReady = () => {
+				if (ws && ws.readyState === WebSocket.OPEN) {
+					clearTimeout(timeoutId);
+					resolve();
+				} else if (!ws) {
+					// initGeminiLiveWebSocket đã tự đóng ws (lỗi/đóng sớm)
+					clearTimeout(timeoutId);
+					reject(new Error('WebSocket đóng trước khi kết nối xong'));
+				} else {
+					setTimeout(checkReady, 100);
+				}
+			};
+			checkReady();
+		});
+
+		window.geminiChat = { method: 'websocket' };
+		console.log('✓ Gemini Live WebSocket session khởi tạo thành công');
 	} catch (err) {
 		console.warn('⚠️ WebSocket init fail, dùng Fetch API fallback:', err.message);
+		closeGeminiLiveWebSocket();
 		window.geminiChat = { method: 'fetch', apiKey: GEMINI_LIVE_CONFIG.apiKey };
-		console.log('✓ Fallback mode (Fetch API) activated');
 	}
 	
 	// Thiết lập trạng thái avatar mặc định là idle
@@ -1008,7 +1096,7 @@ function setupMicVolumeDetection() {
 		
 		// 🔴 DEBUG: In ra volume hiện tại mỗi 1 giây
 		if (Math.random() < 0.05) { // ~5% chance để không spam log
-			console.log(`📊 Volume: ${average.toFixed(1)} (threshold: ${VOLUME_THRESHOLD})`);
+			vlog(`📊 Volume: ${average.toFixed(1)} (threshold: ${VOLUME_THRESHOLD})`);
 		}
 		
 		if (average > VOLUME_THRESHOLD) {
@@ -1144,6 +1232,9 @@ function attachEventListeners() {
 	endBtn.addEventListener('click', () => {
 		// Dừng gửi audio
 		stopSendingAudio();
+
+		// Đóng WebSocket chủ động (không để onclose tự động reconnect)
+		closeGeminiLiveWebSocket();
 		
 		// Dừng Text-to-Speech nếu đang phát
 		if (window.speechSynthesis) {
