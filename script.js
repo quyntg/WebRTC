@@ -900,42 +900,10 @@ async function connectGeminiLiveSocket() {
 		return;
 	}
 	
-	// 🔴 KHỞI TẠO GEMINI LIVE CLIENT (WebSocket)
-	try {
-		const wsSuccess = initGeminiLiveWebSocket();
-		if (!wsSuccess) {
-			throw new Error('Failed to init WebSocket');
-		}
-
-		// Chờ WebSocket mở, có timeout để không treo vô hạn nếu server
-		// không phản hồi và cũng không bắn onerror.
-		await new Promise((resolve, reject) => {
-			const timeoutId = setTimeout(() => {
-				reject(new Error('Timeout khi chờ WebSocket kết nối'));
-			}, WS_RECONNECT_CONFIG.connectTimeoutMs);
-
-			const checkReady = () => {
-				if (ws && ws.readyState === WebSocket.OPEN) {
-					clearTimeout(timeoutId);
-					resolve();
-				} else if (!ws) {
-					// initGeminiLiveWebSocket đã tự đóng ws (lỗi/đóng sớm)
-					clearTimeout(timeoutId);
-					reject(new Error('WebSocket đóng trước khi kết nối xong'));
-				} else {
-					setTimeout(checkReady, 100);
-				}
-			};
-			checkReady();
-		});
-
-		window.geminiChat = { method: 'websocket' };
-		console.log('✓ Gemini Live WebSocket session khởi tạo thành công');
-	} catch (err) {
-		console.warn('⚠️ WebSocket init fail, dùng Fetch API fallback:', err.message);
-		closeGeminiLiveWebSocket();
-		window.geminiChat = { method: 'fetch', apiKey: GEMINI_LIVE_CONFIG.apiKey };
-	}
+	// 🔴 SKIP WebSocket - v1alpha không hỗ trợ models, dùng REST API trực tiếp
+	console.warn('⚠️ WebSocket v1alpha không hỗ trợ models, sử dụng REST API (Fetch) trực tiếp');
+	window.geminiChat = { method: 'fetch', apiKey: GEMINI_LIVE_CONFIG.apiKey };
+	console.log('✓ Sẵn sàng dùng Fetch API');
 	
 	// Thiết lập trạng thái avatar mặc định là idle
 	setAvatarState('idle');
