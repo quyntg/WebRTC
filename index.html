@@ -5,6 +5,8 @@
         <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
         <title>Avatar WebRTC — Simli + Gemini Live</title>
         <link rel="stylesheet" href="style.css" />
+        <!-- Load environment config -->
+        <script src="env-config.js"></script>
     </head>
     <body>
         <!-- ============================================================
@@ -39,6 +41,10 @@
                 </div>
                 <div class="topbar-actions">
                     <button id="toggleFaqBtn" class="ghost-btn" type="button">Hiện FAQ minh hoạ</button>
+                    <button id="startListeningBtn" class="ghost-btn" type="button">
+                        <span aria-hidden="true">🎤</span>
+                        <span>Bắt đầu trò chuyện</span>
+                    </button>
                     <button id="micBtn" class="ghost-btn" type="button" aria-pressed="true">
                         <span id="micIcon" aria-hidden="true"></span>
                         <span id="micLabel">Micro bật</span>
@@ -47,10 +53,12 @@
                 </div>
             </header>
             <div id="stage" class="stage stage--default">
-                <!-- Khung Avatar: chứa thẻ video WebRTC chuẩn -->
+                <!-- Khung Avatar: chứa thẻ video NLM Mascot -->
                 <div id="avatarFrame" class="avatar-frame">
-                    <!-- <video id="avatarVideo" class="avatar-video" autoplay playsinline poster=""> Trình duyệt của bạn không hỗ trợ thẻ video. </video> -->
-                    <img id="avatarVideo" class="avatar-video" src="/ava doc.jpg" alt="Khung video Avatar AI" />
+                    <video id="avatarVideo" class="avatar-video" autoplay loop muted playsinline>
+                        <source src="assets/avatars/NLM Mascot Full Professional_D_animation_clip.webm" type="video/webm" />
+                        Trình duyệt của bạn không hỗ trợ thẻ video.
+                    </video>
                     <div id="avatarPlaceholder" class="avatar-placeholder">
                         <span class="avatar-placeholder-ring"></span>
                         <p>Avatar sẽ hiển thị tại đây khi luồng WebRTC từ Simli kết nối thành công</p>
@@ -65,8 +73,11 @@
                         <h2>Nội dung minh hoạ</h2>
                         <p>Hiển thị song song khi trợ lý đang giải thích một câu hỏi thường gặp.</p>
                     </div>
-                    <div class="faq-gif-wrap">
-                        <img id="faqGif" class="faq-gif" src="/tutorial.gif" alt="Ảnh GIF minh hoạ nội dung FAQ" />
+                    <div class="faq-gif-wrap" hidden>
+                        <video id="faqVideo" class="faq-gif" autoplay loop muted playsinline>
+                            <source src="assets/video/cute.mp4" type="video/mp4" />
+                            <!-- Thêm file video minh hoạ nếu cần -->
+                        </video>
                     </div>
                 </div>
             </div>

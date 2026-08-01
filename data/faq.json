@@ -1,0 +1,32 @@
+[
+  {
+    "id": 1,
+    "question": "Giờ làm việc của công ty",
+    "answer": "Chúng tôi mở cửa từ 8:00 sáng đến 5:00 chiều, Thứ Hai đến Thứ Sáu. Vào các ngày lễ, chúng tôi có thể đóng cửa.",
+    "gif_sequence": ["working_hours.gif"]
+  },
+  {
+    "id": 2,
+    "question": "Thủ tục xin visa",
+    "answer": "Để xin visa, bạn cần chuẩn bị: CMND, hộ chiếu, ảnh 4x6, đơn xin visa. Quá trình phê duyệt mất từ 5-10 ngày làm việc.",
+    "gif_sequence": ["visa_step1.gif", "visa_step2.gif", "visa_step3.gif"]
+  },
+  {
+    "id": 3,
+    "question": "Cách liên hệ support",
+    "answer": "Bạn có thể liên hệ chúng tôi qua: Email: support@company.com, Điện thoại: 1800-123456, Chat: website của chúng tôi.",
+    "gif_sequence": ["contact_info.gif"]
+  },
+  {
+    "id": 4,
+    "question": "Chính sách hoàn tiền",
+    "answer": "Nếu bạn không hài lòng với dịch vụ trong vòng 30 ngày, chúng tôi sẽ hoàn tiền 100% không có câu hỏi nào.",
+    "gif_sequence": ["refund_policy.gif"]
+  },
+  {
+    "id": 5,
+    "question": "Cách sử dụng tài khoản của tôi",
+    "answer": "Đăng nhập bằng email và mật khẩu của bạn. Sau đó, bạn có thể cập nhật hồ sơ, xem lịch sử, quản lý đơn hàng.",
+    "gif_sequence": ["account_usage.gif"]
+  }
+]

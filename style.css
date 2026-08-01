@@ -412,6 +412,46 @@ button {
     object-fit: contain;
 }
 
+/* ============================================================
+   TRẠNG THÁI AVATAR (idle, listening, speaking)
+============================================================= */
+/* Idle state: bình thường */
+.avatar-frame[data-state="idle"] {
+    border-color: var(--border);
+}
+
+/* Listening state: người dùng đang nói - thêm hiệu ứng pulse */
+.avatar-frame[data-state="listening"] {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 2px var(--bg), 0 0 0 4px var(--accent);
+    animation: pulse-listening 1.5s ease-in-out infinite;
+}
+
+@keyframes pulse-listening {
+    0%, 100% {
+        box-shadow: 0 0 0 2px var(--bg), 0 0 0 4px var(--accent);
+    }
+    50% {
+        box-shadow: 0 0 0 2px var(--bg), 0 0 0 8px rgba(91, 140, 255, 0.6);
+    }
+}
+
+/* Speaking state: Gemini đang nói - hiệu ứng khác */
+.avatar-frame[data-state="speaking"] {
+    border-color: var(--success);
+    box-shadow: 0 0 0 2px var(--bg), 0 0 0 4px var(--success);
+    animation: pulse-speaking 1s ease-in-out infinite;
+}
+
+@keyframes pulse-speaking {
+    0%, 100% {
+        box-shadow: 0 0 0 2px var(--bg), 0 0 0 4px var(--success);
+    }
+    50% {
+        box-shadow: 0 0 0 2px var(--bg), 0 0 0 8px rgba(61, 220, 151, 0.6);
+    }
+}
+
 .transcript-bar {
     border-top: 1px solid var(--border);
     background: var(--bg-panel);
