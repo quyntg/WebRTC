@@ -425,13 +425,11 @@ async function sendMessageToGemini(userMessage = 'Xin chào') {
    GEMINI LIVE WebSocket: GỬI MESSAGE & NHẬN AUDIO RESPONSE
 ================================================================== */
 function buildGeminiWebSocketUrl() {
-	const apiKey = GEMINI_LIVE_CONFIG.apiKey;
-	if (!apiKey) {
-		throw new Error('Thiếu GEMINI_API_KEY (kiểm tra env-config.js)');
-	}
-	// Live API chỉ chạy qua wss:// (không có biến thể ws:// cho localhost),
-	// nên không cần nhánh chọn protocol theo location.protocol.
-	return `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key=${apiKey}`;
+    const apiKey = window.GEMINI_API_KEY;  // ← Đọc trực tiếp từ window
+    if (!apiKey) {
+        throw new Error('Thiếu GEMINI_API_KEY (kiểm tra env-config.js)');
+    }
+    return `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key=${apiKey}`;
 }
 
 function sendSetupMessage(socket) {
