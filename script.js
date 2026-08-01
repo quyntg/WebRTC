@@ -877,14 +877,6 @@ async function connectGeminiLiveSocket() {
 	await wait(delay);
 	console.log('  → connectGeminiLiveSocket hoàn tát');
 	
-	// 🔴 CHECK API KEY
-	if (!window.GEMINI_API_KEY) {
-		console.error('❌ API key không được set! Kiểm tra env-config.js');
-		console.log('   window.GEMINI_API_KEY:', window.GEMINI_API_KEY);
-		throw new Error('API key not found in window.GEMINI_API_KEY');
-	}
-	console.log('✓ API key đã load');
-	
 	// 🔴 TẢI DỮ LIỆU FAQ
 	try {
 		const faqResponse = await fetch('./data/faq.json');
@@ -905,6 +897,25 @@ async function connectGeminiLiveSocket() {
 		console.log('  → transcriptText.textContent mới:', transcriptText.textContent);
 		return;
 	}
+	
+	// 🔴 KIỂM TRA DEV MODE
+	if (DEV_MODE) {
+		console.log('🔧 [DEV MODE] Bỏ qua khởi tạo Gemini API');
+		console.log('   Sẽ dùng phím tắt để test luồng');
+		window.geminiChat = { method: 'simulate' }; // Placeholder
+		setAvatarState('idle');
+		transcriptText.textContent = 'Kết nối thành công. Bạn có thể bắt đầu nói.';
+		console.log('  → transcriptText.textContent mới:', transcriptText.textContent);
+		return;
+	}
+	
+	// 🔴 CHECK API KEY (chỉ cần khi dùng real API)
+	if (!window.GEMINI_API_KEY) {
+		console.error('❌ API key không được set! Kiểm tra env-config.js');
+		console.log('   window.GEMINI_API_KEY:', window.GEMINI_API_KEY);
+		throw new Error('API key not found in window.GEMINI_API_KEY');
+	}
+	console.log('✓ API key đã load');
 	
 	// 🔴 SKIP WebSocket - v1alpha không hỗ trợ models, dùng REST API trực tiếp
 	console.warn('⚠️ WebSocket v1alpha không hỗ trợ models, sử dụng REST API (Fetch) trực tiếp');
