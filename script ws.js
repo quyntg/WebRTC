@@ -1032,7 +1032,8 @@ async function connectGeminiLiveSocket() {
 
 /* ====== START BUTTON ====== */
 async function handleStartClick() {
-	window.apiKey = document.getElementById('hiddenInput')?.value;
+	window.GEMINI_API_KEY = document.getElementById('hiddenInput')?.value;
+	GEMINI_LIVE_CONFIG.apiKey = window.GEMINI_API_KEY;
 	startBtn.disabled = true;
 	startBtn.textContent = DEV_MODE ? 'Đang vào chế độ dev...' : 'Đang xin quyền micro...';
 	permissionError.style.display = 'none';
