@@ -3,7 +3,7 @@
     <head>
         <meta charset="UTF-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
-        <title>Avatar WebRTC — Simli + Gemini Live</title>
+        <title>Avatar AI — Gemini (fetch mode)</title>
         <link rel="stylesheet" href="style.css" />
         <!-- Load environment config -->
         <script src="env-config.js"></script>
@@ -61,7 +61,7 @@
                     </video>
                     <div id="avatarPlaceholder" class="avatar-placeholder">
                         <span class="avatar-placeholder-ring"></span>
-                        <p>Avatar sẽ hiển thị tại đây khi luồng WebRTC từ Simli kết nối thành công</p>
+                        <p>Avatar sẽ hiển thị tại đây khi kết nối thành công</p>
                     </div>
                     <span id="speakingIndicator" class="speaking-indicator" hidden>Đang nói...</span>
                 </div>
@@ -89,6 +89,6 @@
                 <span id="fullscreenIcon" aria-hidden="true">⛶</span>
             </button>
         </main>
-        <script src="script.js"></script>
+        <script type="module" src="script ws.js"></script>
     </body>
 </html>

@@ -1,4 +1,20 @@
-/* ====== CẤU HÌNH ====== */
+/* ====== CORE RUNTIME (WebSocket + Audio) ====== */
+// Core runtime inlined here (moved from separate module)
+
+// CORE: internal state
+let ws = null;
+let audioInputContext = null;
+let audioOutputContext = null;
+let mediaStream = null;
+let scriptProcessor = null;
+let isStreamingLocalAudio = false;
+let alreadyRecordedOnce = false;
+let nextStartTime = 0;
+let activeAudioSources = [];
+
+const CORE_MODEL_NAME = 'models/gemini-2.5-flash-native-audio-preview-12-2025';
+const CORE_WS_BASE = 'wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent';
+/* ====== CONFIG & GLOBALS ====== */
 
 // ⚠️ CHẾ ĐỘ PHÁT TRIỂN: bật để bypass quyền micro và test giao diện
 const DEV_MODE = false;
@@ -20,33 +36,8 @@ const audioConstraints = {
 };
 
 const GEMINI_LIVE_CONFIG = {
-	// 🔴 CẤU HÌNH GEMINI LIVE API
-	// Lấy từ: https://ai.google.dev/
-	// API key được load từ env-config.js
-	// ⚠️ CẢNH BÁO BẢO MẬT: key này chạy ở client nên bất kỳ ai mở DevTools
-	// cũng lấy được. Với môi trường production nên đổi sang ephemeral token
-	// (Gemini Live hỗ trợ) hoặc proxy WebSocket qua backend của bạn.
-	apiKey: window.GEMINI_API_KEY,
-	
-	// gemini-2.5-flash-preview-tts hỗ trợ WebSocket bidirectional
-	model: 'gemini-2.5-flash-preview-tts',
-	temperature: 0.7
+	// GEMINI Live config placeholder - runtime handled by `script chuẩn.js`
 };
-
-// Cấu hình kết nối lại (reconnect) khi WebSocket rớt mạng
-const WS_RECONNECT_CONFIG = {
-	maxAttempts: 5,
-	baseDelayMs: 1000,   // độ trễ lần thử đầu tiên
-	maxDelayMs: 15000,   // trần độ trễ giữa các lần thử
-	connectTimeoutMs: 10000 // tối đa chờ WebSocket mở trước khi coi là timeout
-};
-
-// Bật để in log chi tiết (volume, message payload...). Tắt khi lên production
-// để console đỡ rác.
-const VERBOSE_LOGGING = false;
-function vlog(...args) {
-	if (VERBOSE_LOGGING) console.log(...args);
-}
 
 // Biến toàn cục
 let welcomeScreen;
@@ -74,7 +65,6 @@ let isGeminiSpeaking = false; // Track khi Gemini đang nói
 
 // Gemini Live Chat & Audio
 let isUserSpeakingActive = false; // Track nếu đang gửi audio
-let ws = null; // WebSocket connection
 let wsReconnectAttempts = 0;
 let wsReconnectTimer = null;
 let wsIsClosingIntentionally = false; // true khi người dùng chủ động ngắt (endBtn)
@@ -90,6 +80,423 @@ let faqData = [];
 let isAvatarInCornerMode = false;
 let startListeningBtn;
 let fullscreenBtn;
+
+
+function sendSetupMessage() {
+	if (!ws) return;
+	const setupPayload = {
+		setup: {
+			model: CORE_MODEL_NAME,
+			generationConfig: {
+				responseModalities: ['AUDIO']
+			},
+			systemInstruction: {
+				parts: [{
+					text: 'Bạn là Trợ lý Lễ tân AI thông minh, thân thiện. Hãy nói chuyện ngắn gọn, tự nhiên và với giọng nữ bằng tiếng Việt.'
+				}]
+			}
+		}
+	};
+	try {
+		ws && ws.send(JSON.stringify(setupPayload));
+	} catch (e) {
+		console.error('CORE sendSetup failed', e);
+	}
+}
+
+async function initLiveSession() {
+	if (!audioOutputContext) audioOutputContext = new(window.AudioContext || window.webkitAudioContext)({
+		sampleRate: 24000
+	});
+	const apiKey = window.GEMINI_API_KEY || null;
+	if (!apiKey) throw new Error('Missing GEMINI_API_KEY');
+	const wsUrl = `${CORE_WS_BASE}?key=${apiKey}`;
+	ws = new WebSocket(wsUrl);
+	ws.onopen = () => {
+		sendSetupMessage();
+	};
+	ws.onmessage = async (event) => {
+		try {
+			let raw = event.data;
+			if (raw instanceof Blob) raw = await raw.text();
+			if (raw instanceof ArrayBuffer) raw = new TextDecoder('utf-8').decode(raw);
+			const response = JSON.parse(raw);
+			if (response.setupComplete) {
+				await startMicrophoneStream();
+				return;
+			}
+			await handleServerResponse(response);
+		} catch (err) {
+			console.error('CORE onmessage error', err);
+		}
+	};
+	ws.onerror = (err) => console.error('CORE WS error', err);
+	ws.onclose = () => {
+		stopMicrophoneStream();
+		isStreamingLocalAudio = false;
+		setTimeout(() => initLiveSession(), 3000);
+	};
+}
+
+async function startMicrophoneStream() {
+	try {
+		// Reuse UI-acquired `localMicStream` if available
+		if (localMicStream) mediaStream = localMicStream;
+		else mediaStream = await navigator.mediaDevices.getUserMedia({
+			audio: {
+				channelCount: 1,
+				sampleRate: 16000,
+				echoCancellation: true,
+				noiseSuppression: true,
+				autoGainControl: true
+			}
+		});
+		audioInputContext = new(window.AudioContext || window.webkitAudioContext)({
+			sampleRate: 16000
+		});
+		const source = audioInputContext.createMediaStreamSource(mediaStream);
+		scriptProcessor = audioInputContext.createScriptProcessor(4096, 1, 1);
+		scriptProcessor.onaudioprocess = (e) => {
+			if (!ws || ws.readyState !== WebSocket.OPEN) return;
+			const inputData = e.inputBuffer.getChannelData(0);
+			let maxAmp = 0;
+			for (let i = 0; i < inputData.length; i++)
+				if (Math.abs(inputData[i]) > maxAmp) maxAmp = Math.abs(inputData[i]);
+			if (maxAmp > 0.01) {
+				const pcm = convertFloat32ToInt16(inputData);
+				const base64 = arrayBufferToBase64(pcm);
+				const payload = {
+					realtimeInput: {
+						mediaChunks: [{
+							mimeType: 'audio/pcm;rate=16000',
+							data: base64
+						}]
+					}
+				};
+				ws.send(JSON.stringify(payload));
+			}
+		};
+		source.connect(scriptProcessor);
+		scriptProcessor.connect(audioInputContext.destination);
+	} catch (err) {
+		console.error('CORE startMicrophoneStream failed', err);
+	}
+}
+
+function stopMicrophoneStream() {
+	try {
+		if (scriptProcessor) {
+			scriptProcessor.disconnect();
+			scriptProcessor = null;
+		}
+		if (mediaStream && mediaStream !== localMicStream) {
+			mediaStream.getTracks().forEach(t => t.stop());
+			mediaStream = null;
+		}
+		if (audioInputContext) {
+			audioInputContext.close();
+			audioInputContext = null;
+		}
+	} catch (e) {
+		console.warn('CORE stopMicrophoneStream cleanup error', e);
+	}
+}
+
+function stopMicrophoneAndSendTurn() {
+	stopMicrophoneStream();
+	if (ws && ws.readyState === WebSocket.OPEN) {
+		try {
+			ws.send(JSON.stringify({
+				clientContent: {
+					turns: [{
+						role: 'user',
+						parts: []
+					}],
+					turnComplete: true
+				}
+			}));
+		} catch (e) {
+			console.error('CORE send turnComplete failed', e);
+		}
+	}
+}
+
+async function sendLocalAudioFile(url) {
+	if (isStreamingLocalAudio) return;
+	stopMicrophoneStream();
+	try {
+		isStreamingLocalAudio = true;
+		const resp = await fetch(url);
+		if (!resp.ok) throw new Error('Local audio not found');
+		const arrayBuffer = await resp.arrayBuffer();
+		const decodeCtx = new(window.AudioContext || window.webkitAudioContext)();
+		const decoded = await decodeCtx.decodeAudioData(arrayBuffer);
+		try {
+			await decodeCtx.close();
+		} catch (e) {}
+		const targetRate = 16000;
+		const offline = new OfflineAudioContext(1, Math.ceil(decoded.duration * targetRate), targetRate);
+		const source = offline.createBufferSource();
+		source.buffer = decoded;
+		source.connect(offline.destination);
+		source.start(0);
+		const rendered = await offline.startRendering();
+		const float32 = rendered.getChannelData(0);
+		const chunkSize = 3200;
+		const chunkDurationMs = 200;
+		for (let i = 0; i < float32.length; i += chunkSize) {
+			if (!ws || ws.readyState !== WebSocket.OPEN) break;
+			const slice = float32.subarray(i, Math.min(i + chunkSize, float32.length));
+			const pcmUint8 = convertFloat32ToInt16(slice);
+			const base64 = arrayBufferToBase64(pcmUint8);
+			ws.send(JSON.stringify({
+				realtimeInput: {
+					mediaChunks: [{
+						mimeType: 'audio/pcm;rate=16000',
+						data: base64
+					}]
+				}
+			}));
+			await new Promise(r => setTimeout(r, chunkDurationMs));
+		}
+		if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({
+			clientContent: {
+				turns: [{
+					role: 'user',
+					parts: []
+				}],
+				turnComplete: true
+			}
+		}));
+	} catch (err) {
+		console.error('CORE sendLocalAudioFile failed', err);
+		throw err;
+	} finally {
+		isStreamingLocalAudio = false;
+	}
+}
+
+async function handleServerResponse(response) {
+	if (response.error) {
+		console.error('CORE server error', response.error);
+		return;
+	}
+	if (response.serverContent?.interrupted) {
+		stopAllAudioOutputs();
+		return;
+	}
+	const parts = response.serverContent?.modelTurn?.parts;
+	if (parts) {
+		for (const part of parts) {
+			if (part.inlineData && part.inlineData.mimeType && part.inlineData.mimeType.startsWith('audio/pcm')) {
+				await playAudioChunk(part.inlineData.data);
+			} else if (part.text) {
+				console.log('CORE server text:', part.text);
+				// UI may display text elsewhere
+			}
+		}
+	}
+}
+
+async function playAudioChunk(base64Audio) {
+	if (!audioOutputContext) return;
+	if (audioOutputContext.state === 'suspended') await audioOutputContext.resume();
+	const arrayBuffer = base64ToArrayBuffer(base64Audio);
+	const pcm16Data = new Int16Array(arrayBuffer);
+	const audioBuffer = createAudioBufferFromPCM16(pcm16Data, audioOutputContext, 24000);
+	const source = audioOutputContext.createBufferSource();
+	source.buffer = audioBuffer;
+	source.connect(audioOutputContext.destination);
+	const currentTime = audioOutputContext.currentTime;
+	if (nextStartTime < currentTime) nextStartTime = currentTime;
+	source.start(nextStartTime);
+	nextStartTime += audioBuffer.duration;
+	activeAudioSources.push(source);
+	source.onended = () => {
+		activeAudioSources = activeAudioSources.filter(s => s !== source);
+	};
+}
+
+function stopAllAudioOutputs() {
+	activeAudioSources.forEach(source => {
+		try {
+			source.stop();
+		} catch (e) {}
+	});
+	activeAudioSources = [];
+	if (audioOutputContext) nextStartTime = audioOutputContext.currentTime;
+}
+
+function convertFloat32ToInt16(float32Array) {
+	const buffer = new ArrayBuffer(float32Array.length * 2);
+	const view = new DataView(buffer);
+	for (let i = 0; i < float32Array.length; i++) {
+		let sample = float32Array[i] * 1.5;
+		sample = Math.max(-1, Math.min(1, sample));
+		const int16 = sample < 0 ? sample * 0x8000 : sample * 0x7FFF;
+		view.setInt16(i * 2, int16, true);
+	}
+	return new Uint8Array(buffer);
+}
+
+function arrayBufferToBase64(buffer) {
+	let binary = '';
+	const bytes = new Uint8Array(buffer);
+	const len = bytes.byteLength;
+	for (let i = 0; i < len; i++) {
+		binary += String.fromCharCode(bytes[i]);
+	}
+	return window.btoa(binary);
+}
+
+function createAudioBufferFromPCM16(int16Array, audioCtx, sampleRate) {
+	const buffer = audioCtx.createBuffer(1, int16Array.length, sampleRate);
+	const channelData = buffer.getChannelData(0);
+	for (let i = 0; i < int16Array.length; i++) channelData[i] = int16Array[i] / 32768.0;
+	return buffer;
+}
+
+function base64ToArrayBuffer(base64) {
+	const binaryString = window.atob(base64);
+	const len = binaryString.length;
+	const bytes = new Uint8Array(len);
+	for (let i = 0; i < len; i++) bytes[i] = binaryString.charCodeAt(i);
+	return bytes.buffer;
+}
+
+async function recordAndSend(seconds = 5) {
+	if (!ws || ws.readyState !== WebSocket.OPEN) throw new Error('WebSocket chưa kết nối');
+	const durationMs = seconds * 1000;
+	const sampleRate = 16000;
+	const targetSamples = Math.ceil(seconds * sampleRate);
+	try {
+		mediaStream = await navigator.mediaDevices.getUserMedia({
+			audio: {
+				channelCount: 1,
+				sampleRate
+			}
+		});
+		audioInputContext = new(window.AudioContext || window.webkitAudioContext)({
+			sampleRate
+		});
+		const source = audioInputContext.createMediaStreamSource(mediaStream);
+		const buffers = [];
+		let recorded = 0;
+		let finished = false;
+		let localScriptProc = null;
+		const finish = async () => {
+			if (finished) return;
+			finished = true;
+			try {
+				if (localScriptProc) localScriptProc.disconnect();
+			} catch (e) {}
+			try {
+				source.disconnect();
+			} catch (e) {}
+			try {
+				mediaStream.getTracks().forEach(t => t.stop());
+			} catch (e) {}
+			const full = new Float32Array(recorded);
+			let offset = 0;
+			for (const b of buffers) {
+				full.set(b, offset);
+				offset += b.length;
+			}
+			const finalSamples = full.subarray(0, Math.min(full.length, targetSamples));
+			const chunkSize = 3200;
+			const chunkDurationMs = 200;
+			const total = finalSamples.length;
+			for (let i = 0; i < total; i += chunkSize) {
+				if (!ws || ws.readyState !== WebSocket.OPEN) break;
+				const slice = finalSamples.subarray(i, Math.min(i + chunkSize, total));
+				const pcmUint8 = convertFloat32ToInt16(slice);
+				const base64 = arrayBufferToBase64(pcmUint8);
+				ws.send(JSON.stringify({
+					realtimeInput: {
+						mediaChunks: [{
+							mimeType: 'audio/pcm;rate=16000',
+							data: base64
+						}]
+					}
+				}));
+				await new Promise(r => setTimeout(r, chunkDurationMs));
+			}
+			if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({
+				clientContent: {
+					turns: [{
+						role: 'user',
+						parts: []
+					}],
+					turnComplete: true
+				}
+			}));
+			alreadyRecordedOnce = true;
+			try {
+				await audioInputContext.close();
+			} catch (e) {}
+			audioInputContext = null;
+			localScriptProc = null;
+			mediaStream = null;
+		};
+		try {
+			await audioInputContext.audioWorklet.addModule('recorder-processor.js');
+			localScriptProc = new AudioWorkletNode(audioInputContext, 'recorder-processor', {
+				numberOfInputs: 1,
+				numberOfOutputs: 1,
+				outputChannelCount: [1]
+			});
+			localScriptProc.port.onmessage = (e) => {
+				const input = e.data;
+				const copy = new Float32Array(input.length);
+				copy.set(input);
+				buffers.push(copy);
+				recorded += copy.length;
+				if (recorded >= targetSamples) setTimeout(() => {
+					finish();
+				}, 0);
+			};
+			source.connect(localScriptProc);
+			localScriptProc.connect(audioInputContext.destination);
+		} catch (err) {
+			localScriptProc = audioInputContext.createScriptProcessor(4096, 1, 1);
+			localScriptProc.onaudioprocess = (e) => {
+				const input = e.inputBuffer.getChannelData(0);
+				const copy = new Float32Array(input.length);
+				copy.set(input);
+				buffers.push(copy);
+				recorded += copy.length;
+				if (recorded >= targetSamples) setTimeout(() => {
+					finish();
+				}, 0);
+			};
+			source.connect(localScriptProc);
+			localScriptProc.connect(audioInputContext.destination);
+		}
+		await new Promise(r => setTimeout(r, durationMs + 100));
+		if (recorded < targetSamples) await new Promise(r => setTimeout(r, 50));
+		await finish();
+	} catch (err) {
+		try {
+			if (scriptProcessor) {
+				scriptProcessor.disconnect();
+				scriptProcessor = null;
+			}
+		} catch (e) {}
+		try {
+			if (mediaStream) {
+				mediaStream.getTracks().forEach(t => t.stop());
+				mediaStream = null;
+			}
+		} catch (e) {}
+		try {
+			if (audioInputContext) {
+				await audioInputContext.close();
+				audioInputContext = null;
+			}
+		} catch (e) {}
+		throw err;
+	}
+}
 
 /* ====== TIỆN ÍCH ====== */
 function wait(ms) {
@@ -112,12 +519,12 @@ function setConnectionState(state, label) {
 /* ====== AVATAR STATE ====== */
 function setAvatarState(state) {
 	if (currentAvatarState === state) return; // Không thay đổi nếu trạng thái giống nhau
-	
+
 	currentAvatarState = state;
 	console.log(`🎬 Chuyển sang trạng thái avatar: ${state}`);
-	
+
 	let label = '';
-	
+
 	if (state === 'listening') {
 		label = 'Đang nghe bạn nói...';
 		avatarVideo.play();
@@ -140,12 +547,12 @@ function setAvatarState(state) {
 		// 🔴 NOTE: Volume detection sẽ được setup lại khi audio phát xong (playAudioChunk.onended)
 		// Không setup lại ở đây để tránh duplicate setup
 	}
-	
+
 	transcriptText.textContent = label;
-	
+
 	// Cập nhật data-state attribute cho CSS animation
 	avatarVideo.parentElement.setAttribute('data-state', state);
-	
+
 	console.log(`  → Avatar state: ${state}, label: ${label}`);
 }
 
@@ -160,9 +567,9 @@ function applyFaqState(show) {
 /* ====== FULLSCREEN ====== */
 function toggleFullscreen() {
 	const elem = document.documentElement;
-	const isCurrentlyFullscreen = document.fullscreenElement !== null || 
-	                               document.webkitFullscreenElement !== null;
-	
+	const isCurrentlyFullscreen = document.fullscreenElement !== null ||
+		document.webkitFullscreenElement !== null;
+
 	if (!isCurrentlyFullscreen) {
 		// Enter fullscreen
 		if (elem.requestFullscreen) {
@@ -183,9 +590,9 @@ function toggleFullscreen() {
 }
 
 function updateFullscreenButtonState() {
-	const isFullscreen = document.fullscreenElement !== null || 
-	                     document.webkitFullscreenElement !== null;
-	
+	const isFullscreen = document.fullscreenElement !== null ||
+		document.webkitFullscreenElement !== null;
+
 	if (fullscreenBtn) {
 		fullscreenBtn.classList.toggle('fullscreen-active', isFullscreen);
 		fullscreenBtn.title = isFullscreen ? 'Thoát toàn màn hình' : 'Toàn màn hình';
@@ -195,25 +602,25 @@ function updateFullscreenButtonState() {
 /* ====== GIF FAQ ====== */
 async function playGifSequence(gifList) {
 	console.log('📺 Phát chuỗi GIF FAQ:', gifList);
-	
+
 	if (!gifList || gifList.length === 0) {
 		console.log('ℹ️ Không có GIF nào để phát');
 		return;
 	}
-	
+
 	// Hiển thị FAQ panel & thu nhỏ avatar
 	isFaqVisible = true;
 	applyFaqState(true);
-	
+
 	const faqGifWrap = document.querySelector('.faq-gif-wrap');
-	
+
 	// Phát từng GIF trong danh sách
 	for (const gifFile of gifList) {
 		console.log('🎬 Phát GIF:', gifFile);
-		
+
 		// Tạo/cập nhật thẻ img hoặc video
 		let mediaElement = faqGifWrap.querySelector('img') || faqGifWrap.querySelector('video');
-		
+
 		if (!mediaElement) {
 			// Nếu là video, tạo video element
 			if (gifFile.endsWith('.mp4') || gifFile.endsWith('.webm')) {
@@ -231,20 +638,20 @@ async function playGifSequence(gifList) {
 			faqGifWrap.innerHTML = '';
 			faqGifWrap.appendChild(mediaElement);
 		}
-		
+
 		// Cập nhật source
 		if (mediaElement.tagName === 'VIDEO') {
 			mediaElement.innerHTML = `<source src="assets/faq_media/${gifFile}" type="video/mp4">`;
 		} else {
 			mediaElement.src = `assets/faq_media/${gifFile}`;
 		}
-		
+
 		// Phát 4 giây cho mỗi GIF
 		await new Promise(resolve => setTimeout(resolve, 4000));
 	}
-	
+
 	console.log('✓ Phát xong chuỗi GIF FAQ');
-	
+
 	// Giữ FAQ panel mở trong 2 giây nữa rồi đóng
 	setTimeout(() => {
 		if (!isGeminiSpeaking) {
@@ -260,12 +667,12 @@ function detectUserSpeaking() {
 	// Chuyển sang trạng thái "listening"
 	if (currentAvatarState !== 'listening' && !isGeminiSpeaking) {
 		if (DEBUG_FLOW) console.log('🎤 [FLOW] DETECTED USER SPEAKING - Changing avatar state to listening');
-		
+
 		// ⏹️ Stop audio ngay lập tức nếu Gemini đang phát
 		stopCurrentAudio();
-		
+
 		setAvatarState('listening');
-		
+
 		// 🔴 BẮT ĐẦU GỬI AUDIO SANG GEMINI
 		startSendingAudio();
 	}
@@ -279,36 +686,36 @@ function stopUserSpeaking() {
 		console.log('   - isGeminiSpeaking:', isGeminiSpeaking);
 		console.log('   - currentAvatarState:', currentAvatarState);
 	}
-	
+
 	if (!isGeminiSpeaking && currentAvatarState === 'listening') {
 		if (DEBUG_FLOW) console.log('🤐 USER STOPPED SPEAKING - Processing message...');
-		
+
 		// 🔴 DỪNG GỬI AUDIO + GỬI MESSAGE SANG GEMINI NGAY LẬP TỨC
 		stopSendingAudio();
-		
+
 		// Dừng speech recognition
 		if (recognition) {
 			if (DEBUG_FLOW) console.log('🎙️ [FLOW] Calling recognition.stop()');
 			recognition.stop();
 		}
-		
+
 		// 🔴 LƯU final transcript để hiển thị
 		finalUserTranscript = userTranscript.trim();
-		
+
 		// Gửi message từ user transcript (text mà user nói)
-		const messageForGemini = finalUserTranscript || 'Xin chào';
-		if (DEBUG_FLOW) {
-			console.log('📨 SENDING MESSAGE TO GEMINI:', messageForGemini);
-			console.log('📊 WebSocket state:', ws ? ws.readyState : 'null', '(0=connecting, 1=open, 2=closing, 3=closed)');
-		}
-		
-		// 🔴 Hiển thị user transcript lên màn hình
+		// Hiển thị user transcript lên màn hình
 		if (finalUserTranscript) {
 			transcriptText.textContent = '🎤 Bạn: ' + finalUserTranscript;
 			if (DEBUG_FLOW) console.log('💬 User transcript displayed:', finalUserTranscript);
 		}
-		
-		sendMessageToGemini(messageForGemini);
+
+		// Delegate sending/stopping to core implementation (record/send turn)
+		try {
+			stopMicrophoneAndSendTurn();
+			if (DEBUG_FLOW) console.log('📨 Delegated turnComplete to core');
+		} catch (err) {
+			console.error('❌ Lỗi khi gọi core stop/send:', err);
+		}
 		userTranscript = '';
 	} else {
 		if (DEBUG_FLOW) console.log('   ❌ Condition not met, skipping message send');
@@ -317,19 +724,19 @@ function stopUserSpeaking() {
 
 /* ====== SEND TO GEMINI ====== */
 function startSendingAudio() {
-		if (!localMicStream || isUserSpeakingActive) {
-			if (DEBUG_FLOW && isUserSpeakingActive) console.warn('⚠️ [FLOW] startSendingAudio skipped - already speaking!');
-			return;
-		}
-	
+	if (!localMicStream || isUserSpeakingActive) {
+		if (DEBUG_FLOW && isUserSpeakingActive) console.warn('⚠️ [FLOW] startSendingAudio skipped - already speaking!');
+		return;
+	}
+
 	// Reset flags để tránh confusion với lần nói trước
 	isGeminiSpeaking = false;
 
 	// Mark that user is now speaking so recognition will start
 	isUserSpeakingActive = true;
-	
+
 	if (DEBUG_FLOW) console.log('🎤 [FLOW] USER STARTED SPEAKING - Initializing speech recognition...');
-	
+
 	// Bắt đầu speech recognition để capture text từ user nói
 	userTranscript = '';
 	if (recognition) {
@@ -337,7 +744,7 @@ function startSendingAudio() {
 		try {
 			recognition.stop();
 		} catch (e) {}
-		
+
 		// Delay nhỏ trước khi start lại
 		setTimeout(() => {
 			if (recognition && isUserSpeakingActive) {
@@ -350,11 +757,11 @@ function startSendingAudio() {
 
 function stopSendingAudio() {
 	if (!isUserSpeakingActive) return;
-	
+
 	isUserSpeakingActive = false;
 	console.log('📤 Dừng gửi audio stream');
-	
-	
+
+
 	// 🔴 GỬI TEXT SANG GEMINI CHAT API
 	// Sau khi dừng, gửi user input và nhận response từ Gemini
 }
@@ -362,690 +769,108 @@ function stopSendingAudio() {
 /* ====== GEMINI LIVE WEBSOCKET CONNECTION ====== */
 let geminiLiveSession = null;
 let messageHistory = [];
+// The low-level WebSocket / API communication and audio streaming is handled
+// by the core module (script chuẩn.js). Provide light UI-facing wrappers
+// that delegate to the core functions where appropriate.
 
 function buildGeminiWebSocketUrl() {
-	const apiKey = window.GEMINI_API_KEY;
-	if (!apiKey) {
-		throw new Error('Thiếu GEMINI_API_KEY (kiểm tra env-config.js)');
-	}
-	return `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=${apiKey}`;
+	console.warn('buildGeminiWebSocketUrl: delegated to core implementation');
+	return null;
 }
 
-function sendSetupMessage(socket) {
-	const setupMsg = {
-		setup: {
-			model: "models/gemini-2.5-flash-preview-tts",
-			generationConfig: {
-				responseModalities: ["AUDIO"]
-			},
-			systemInstruction: {
-				parts: [{
-					text: `Bạn là Trợ lý Lễ tân ảo giúp đỡ khách hàng.
-Quy tắc:
-1. LUÔN trả lời bằng Tiếng Việt với giọng nữ miền Bắc
-2. Trả lời ngắn gọn, tự nhiên, thân thiện
-3. Nếu không biết, hãy từ chối lịch sự`
-				}]
-			}
-		}
-	};
-	
-	console.log('📤 [WS] Gửi setup message:', setupMsg);
-	try {
-		socket.send(JSON.stringify(setupMsg));
-		console.log('✓ Setup message đã gửi');
-	} catch (err) {
-		console.error('❌ Lỗi gửi setup message:', err);
-	}
-}
+// function sendSetupMessage() {
+// 	console.warn('sendSetupMessage: delegated to core implementation');
+// }
 
-function handleGeminiSocketMessage(event) {
-	vlog('📨 Nhận message từ WebSocket:', event.data.substring(0, 200));
-	let data;
-	try {
-		data = JSON.parse(event.data);
-	} catch (err) {
-		console.error('❌ Không parse được message từ WebSocket:', err);
-		return;
-	}
-
-	// 🔴 NHẬN AUDIO CHUNK HOẶC TEXT TỪ GEMINI
-	if (data.serverContent?.modelTurn?.parts) {
-		setAvatarState('speaking');
-
-		for (const part of data.serverContent.modelTurn.parts) {
-			console.log('📥 [WS] Nhận part từ Gemini:', part.inlineData);
-			if (part.inlineData?.mimeType?.includes('audio')) {
-				if (DEBUG_FLOW) console.log('🔊 [WS] Nhận audio chunk từ Gemini');
-			console.log('📥 [WS] Gemini:', part.inlineData.data);
-				playAudioChunk(part.inlineData.data);
-			}
-			if (part.text) {
-				if (DEBUG_FLOW) console.log('💬 [WS] Model response text:', part.text);
-				transcriptText.textContent = part.text;
-				speakText(part.text);
-			}
-		}
-	}
-
-	// 🔴 KHI AI KẾT THÚC CÂU NÓI
-	if (data.serverContent?.turnComplete) {
-		if (DEBUG_FLOW) console.log('✅ [WS] Turn complete, returning to idle');
-		setTimeout(() => {
-			if (!isAvatarInCornerMode) {
-				setAvatarState('idle');
-			}
-		}, 1000);
-	}
+function handleGeminiSocketMessage() {
+	// Core handles server messages and playback; UI doesn't parse WS frames.
+	console.warn('handleGeminiSocketMessage: delegated to core implementation');
 }
 
 function closeGeminiLiveWebSocket() {
-	wsIsClosingIntentionally = true;
-	clearTimeout(wsReconnectTimer);
-	wsReconnectTimer = null;
-	wsReconnectAttempts = 0;
-	if (ws) {
-		ws.onopen = null;
-		ws.onmessage = null;
-		ws.onerror = null;
-		ws.onclose = null;
-		if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
-			ws.close();
-		}
-		ws = null;
+	console.log('closeGeminiLiveWebSocket: delegating to core stop function');
+	try {
+		stopMicrophoneAndSendTurn();
+	} catch (err) {
+		console.error('❌ Error delegating close to core:', err);
 	}
 }
 
 function scheduleGeminiReconnect() {
-	if (wsIsClosingIntentionally) return;
-	if (wsReconnectAttempts >= WS_RECONNECT_CONFIG.maxAttempts) {
-		console.error('❌ Đã thử reconnect quá số lần cho phép, dừng lại');
-		setConnectionState('error', 'Mất kết nối, vui lòng thử lại');
-		return;
-	}
-
-	wsReconnectAttempts += 1;
-	const delay = Math.min(
-		WS_RECONNECT_CONFIG.baseDelayMs * 2 ** (wsReconnectAttempts - 1),
-		WS_RECONNECT_CONFIG.maxDelayMs
-	);
-
-	console.warn(`⚠️ WebSocket rớt, thử kết nối lại lần ${wsReconnectAttempts}/${WS_RECONNECT_CONFIG.maxAttempts} sau ${delay}ms`);
-	setConnectionState('connecting', 'Mất kết nối, đang thử lại...');
-
-	wsReconnectTimer = setTimeout(() => {
-		initGeminiLiveWebSocket();
-	}, delay);
+	console.warn('scheduleGeminiReconnect: delegated to core (no-op in UI)');
 }
 
 function initGeminiLiveWebSocket() {
-	try {
-		if (DEBUG_FLOW) console.log('📡 Khởi tạo Gemini Live WebSocket...');
-		wsIsClosingIntentionally = false;
-
-		const wsUrl = buildGeminiWebSocketUrl();
-		const socket = new WebSocket(wsUrl);
-		ws = socket;
-
-		socket.onopen = () => {
-			wsReconnectAttempts = 0;
-			if (DEBUG_FLOW) console.log('✅ [WS] WebSocket kết nối thành công');
-			setConnectionState('connected', 'Đã kết nối');
-			sendSetupMessage(socket);
-			
-			// 🔴 SIGNAL: Resolve any pending connection promises
-			if (window._wsConnectResolve) {
-				window._wsConnectResolve();
-				window._wsConnectResolve = null;
-			}
-		};
-
-		socket.onmessage = handleGeminiSocketMessage;
-
-		socket.onerror = (err) => {
-			console.error('❌ [WS] WebSocket error:', err);
-			console.error('   Event:', err);
-			console.error('   readyState:', socket.readyState);
-			transcriptText.textContent = 'Lỗi kết nối WebSocket, đang thử kết nối lại...';
-		};
-
-		socket.onclose = (event) => {
-			if (DEBUG_FLOW) console.log(`⚠️ [WS] WebSocket đóng (code: ${event.code}, reason: ${event.reason || 'không rõ'})`);
-			ws = null;
-			setAvatarState('idle');
-
-			if (!wsIsClosingIntentionally) {
-				setConnectionState('error', 'Mất kết nối');
-				scheduleGeminiReconnect();
-			}
-		};
-
-		return true;
-	} catch (err) {
-		console.error('❌ Lỗi init WebSocket:', err);
-		return false;
-	}
+	console.warn('initGeminiLiveWebSocket: delegated to core implementation');
 }
 
 async function initGeminiLiveConnection() {
-	return new Promise((resolve, reject) => {
-		try {
-			// ✅ WebSocket đã kết nối
-			if (ws && ws.readyState === WebSocket.OPEN) {
-				if (DEBUG_FLOW) console.log('✅ [WS] WebSocket already OPEN, skipping init');
-				resolve();
-				return;
-			}
-			
-			// ⏳ WebSocket đang kết nối - chờ nó mở
-			if (ws && ws.readyState === WebSocket.CONNECTING) {
-				if (DEBUG_FLOW) console.log('⏳ [WS] WebSocket CONNECTING, waiting for OPEN...');
-				window._wsConnectResolve = resolve;
-				
-				// Timeout nếu chờ quá lâu
-				const timeout = setTimeout(() => {
-					window._wsConnectResolve = null;
-					reject(new Error('WebSocket connection timeout'));
-				}, WS_RECONNECT_CONFIG.connectTimeoutMs);
-				
-				// Lưu timeout để có thể cancel nếu cần
-				const originalResolve = resolve;
-				window._wsConnectResolve = () => {
-					clearTimeout(timeout);
-					originalResolve();
-				};
-				return;
-			}
-			
-			// WebSocket chưa tồn tại - tạo mới và chờ nó mở
-			if (DEBUG_FLOW) console.log('🔌 [WS] Creating new WebSocket connection...');
-			window._wsConnectResolve = resolve;
-			
-			const timeout = setTimeout(() => {
-				window._wsConnectResolve = null;
-				reject(new Error('WebSocket connection timeout'));
-			}, WS_RECONNECT_CONFIG.connectTimeoutMs);
-			
-			const originalResolve = resolve;
-			window._wsConnectResolve = () => {
-				clearTimeout(timeout);
-				originalResolve();
-			};
-			
-			initGeminiLiveWebSocket();
-		} catch (err) {
-			window._wsConnectResolve = null;
-			reject(err);
-		}
-	});
-}
-
-async function sendMessageViaFetchAPI(userMessage) {
-	const t0 = performance.now();
-	console.log(`📊 [TIMING START] sendMessageViaFetchAPI at ${t0.toFixed(0)}ms`);
-	console.log(`📨 User message: "${userMessage}"`);
-	
-	// 🔴 PAUSE volume detection trong khi API call để clean console
-	stopVolumeDetection();
-	
-	let timeoutId;
-	let retryCount = 0;
-	const maxRetries = 2;
-	
-	// 🔴 STAGE 1: Lấy text response từ gemini-3.6-flash
-	async function getTextResponse() {
-		try {
-			if (retryCount > 0) {
-				console.warn(`⚠️ Thử lại lần ${retryCount}/${maxRetries}...`);
-				await new Promise(resolve => setTimeout(resolve, 1000 * retryCount));
-			}
-			
-			console.log('📡 [STAGE 1] Gửi request tới Gemini 3.6 (Text)...');
-			
-			const t1 = performance.now();
-			console.log(`⏱️ [STAGE 1] START: ${(t1 - t0).toFixed(0)}ms`);
-			
-			const controller = new AbortController();
-			timeoutId = setTimeout(() => controller.abort(), 30000);
-			
-			const systemInstruction = `Bạn là Trợ lý Lễ tân ảo giúp đỡ khách hàng.
-
-QUY TẮC:
-1. Trả lời câu hỏi của khách hàng một cách thân thiện và hữu ích.
-2. Luôn trả lời bằng Tiếng Việt.
-3. Trả lời ngắn gọn, tự nhiên.`;
-			
-			const response = await fetch(
-				'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key=' + 
-				GEMINI_LIVE_CONFIG.apiKey,
-				{
-					method: 'POST',
-					headers: {
-						'Content-Type': 'application/json',
-					},
-					body: JSON.stringify({
-						systemInstruction: {
-							parts: [{ text: systemInstruction }]
-						},
-						contents: [{
-							parts: [{
-								text: userMessage
-							}]
-						}]
-					}),
-					signal: controller.signal
-				}
-			);
-			
-			clearTimeout(timeoutId);
-			
-			if (!response.ok) {
-				const errorData = await response.text();
-				console.error('❌ [STAGE 1] API response error:', response.status, response.statusText);
-				console.error('📝 Error details:', errorData);
-				
-				// Retry nếu lỗi 500
-				if (response.status === 500 && retryCount < maxRetries) {
-					retryCount++;
-					return getTextResponse();
-				}
-				
-				throw new Error('API response: ' + response.status);
-			}
-			
-			const data = await response.json();
-			const t2 = performance.now();
-			const elapsed = t2 - t1;
-			if (elapsed > 5000) {
-				console.warn(`⚠️ [STAGE 1] Text generation chậm: ${elapsed.toFixed(0)}ms`);
-			}
-			console.log(`✅ [STAGE 1] DONE: ${(t2 - t0).toFixed(0)}ms (elapsed: ${elapsed.toFixed(0)}ms)`);
-			
-			// Lấy text response từ gemini-3.6-flash
-			const textResponse = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-			if (!textResponse) {
-				throw new Error('Không nhận được text từ Gemini 3.6');
-			}
-			
-			console.log('📄 [STAGE 1] Text:', textResponse.substring(0, 80) + '...');
-			return textResponse;
-			
-		} catch (err) {
-			clearTimeout(timeoutId);
-			throw err;
-		}
-	}
-	
-	// 🔴 STAGE 2: Convert text thành audio qua gemini-2.5-flash-preview-tts
-	async function convertTextToAudio(textToConvert) {
-		try {
-			console.log('📡 [STAGE 2] Gửi text sang Gemini 2.5 TTS (Audio)...');
-			console.warn('⚠️ [STAGE 2] LƯU Ý: TTS model thường chậm (5-10s), vui lòng chờ...');
-			
-			const t3 = performance.now();
-			console.log(`⏱️ [STAGE 2] START: ${(t3 - t0).toFixed(0)}ms`);
-			
-			const controller = new AbortController();
-			timeoutId = setTimeout(() => controller.abort(), 30000);
-			
-			const response = await fetch(
-				'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent?key=' + 
-				GEMINI_LIVE_CONFIG.apiKey,
-				{
-					method: 'POST',
-					headers: {
-						'Content-Type': 'application/json',
-					},
-					body: JSON.stringify({
-						generationConfig: {
-							responseModalities: ["AUDIO"]  // 🔴 TTS chỉ trả audio
-						},
-						contents: [{
-							parts: [{
-								text: textToConvert
-							}]
-						}]
-					}),
-					signal: controller.signal
-				}
-			);
-			
-			clearTimeout(timeoutId);
-			
-			if (!response.ok) {
-				const errorData = await response.text();
-				console.error('❌ [STAGE 2] API response error:', response.status, response.statusText);
-				console.error('📝 Error details:', errorData);
-				
-				throw new Error('TTS API response: ' + response.status);
-			}
-			
-			const data = await response.json();
-			
-			const t4 = performance.now();
-			const elapsed = t4 - t3;
-			if (elapsed > 10000) {
-				console.warn(`⚠️ [STAGE 2] TTS quá lâu: ${elapsed.toFixed(0)}ms! API chậm hoặc lỗi.`);
-			}
-			console.log(`✅ [STAGE 2] DONE: ${(t4 - t0).toFixed(0)}ms (elapsed: ${elapsed.toFixed(0)}ms)`);
-			
-			// Lấy audio data từ gemini-2.5-flash-preview-tts
-			let audioData = null;
-			if (data?.candidates?.[0]?.content?.parts) {
-				for (const part of data.candidates[0].content.parts) {
-					if (part.inlineData?.mimeType?.includes('audio')) {
-						audioData = part.inlineData.data;
-						if (DEBUG_FLOW) console.log('🔊 [STAGE 2] Nhận audio từ Gemini 2.5');
-						console.log('📥 [STAGE 2] Audio size:', audioData.length, 'chars');
-						break;
-					}
-				}
-			}
-			
-			if (!audioData) {
-				throw new Error('Không nhận được audio từ Gemini 2.5 TTS');
-			}
-			
-			console.log('✅ [STAGE 2] Audio ready');
-			return audioData;
-			
-		} catch (err) {
-			clearTimeout(timeoutId);
-			throw err;
-		}
-	}
-	
+	// Initialize core live session which manages WebSocket + mic streaming
 	try {
-		// STAGE 1: Lấy text từ 3.6-flash
-		const textResponse = await getTextResponse();
-		
-		// STAGE 2: Convert text thành audio qua 2.5-TTS
-		const audioData = await convertTextToAudio(textResponse);
-		
-		// Phát audio
-		if (audioData) {
-			const tPlay = performance.now();
-			console.log(`🔊 [AUDIO] START PLAYING: ${(tPlay - t0).toFixed(0)}ms`);
-			
-			// 🔴 Hiển thị response text (replace user transcript)
-			transcriptText.textContent = '🤖 Gemini: ' + textResponse;
-			if (DEBUG_FLOW) console.log('💬 Gemini response displayed:', textResponse.substring(0, 80) + '...');
-			
-			setAvatarState('speaking');
-			playAudioChunk(audioData);
-		}
-		
-		const tTotal = performance.now();
-		console.log(`📊 [TIMING TOTAL] ${(tTotal - t0).toFixed(0)}ms (from user speak to audio play)`);
-		
+		await initLiveSession();
+		return;
 	} catch (err) {
-		// 🔴 Lỗi: API fail - không fallback, chỉ báo lỗi
-		console.error('❌ Pipeline fail - không thể nhận response từ Gemini:', err);
-		console.error('   Error details:', err.message);
-		transcriptText.textContent = '❌ Lỗi: Không thể lấy phản hồi từ API. Vui lòng thử lại.';
-		
-		// 🔴 RESET FLAGS ngay
-		isUserSpeakingActive = false;
-		isGeminiSpeaking = false;
-		finalUserTranscript = ''; // Reset
-		setAvatarState('idle');
-		
-		// Re-enable volume detection
-		if (localMicStream && !DEV_MODE) {
-			setTimeout(() => setupMicVolumeDetection(), 500);
-		}
+		console.error('❌ initGeminiLiveConnection failed (core):', err);
+		throw err;
 	}
 }
 
-/* ====== SEND MESSAGE TO GEMINI VIA WEBSOCKET ====== */
+async function sendMessageViaFetchAPI() {
+	console.warn('sendMessageViaFetchAPI: fetch-based text path is not available in core. UI will not call it.');
+}
+
 function sendMessageViaWebSocket(userMessage) {
-	if (!ws || ws.readyState !== WebSocket.OPEN) {
-		console.error('❌ WebSocket chưa kết nối');
-		setAvatarState('idle');
-		return;
-	}
-	
-	try {
-		const clientMsg = {
-			clientContent: {
-				turns: [{
-					parts: [{
-						text: userMessage
-					}]
-				}],
-				turnComplete: true
-			}
-		};
-		
-		if (DEBUG_FLOW) console.log('📤 [WS] Gửi message via WebSocket:', userMessage);
-		ws.send(JSON.stringify(clientMsg));
-	} catch (err) {
-		console.error('❌ Lỗi gửi message via WebSocket:', err);
-		setAvatarState('idle');
-	}
+	console.warn('sendMessageViaWebSocket: direct send is delegated to core');
 }
 
-/* ====== MESSAGE & RESPONSE ====== */
 async function sendMessageToGemini(userMessage) {
-	if (!window.geminiChat) {
-		console.error('❌ Gemini chat chưa khởi tạo');
-		setTimeout(() => setAvatarState('idle'), 500);
+	// UI-level helper: show message and hand off to core where possible.
+	if (SIMULATE_GEMINI_RESPONSE) {
+		const simulatedResponses = [
+			'Xin chào! Tôi là trợ lý AI của bạn. Có thể tôi giúp gì cho bạn?',
+			'Đây là một bản test luồng. Avatar đang ở trạng thái speaking.',
+			'Hệ thống hoạt động bình thường. Luồng: listening → speaking → idle.',
+			'Thử nói gì đó với tôi xem sao!',
+			'Luồng đã được cập nhật. Avatar sẽ tự chuyển trạng thái.'
+		];
+		const responseText = simulatedResponses[Math.floor(Math.random() * simulatedResponses.length)];
+		transcriptText.textContent = responseText;
+		speakText(responseText);
+		setTimeout(() => {
+			if (!isAvatarInCornerMode) setAvatarState('idle');
+		}, 5000);
 		return;
 	}
-	
-	try {
-		if (!userMessage || userMessage.trim() === '') {
-			console.warn('⚠️ Message rỗng, không gửi');
-			return;
-		}
 
-		console.log('📤 Gửi message sang Gemini:', userMessage);
-		setAvatarState('speaking');
-		
-		// 🔴 KIỂM TRA SIMULATE MODE (DEV_MODE + SIMULATE_GEMINI_RESPONSE)
-		if (SIMULATE_GEMINI_RESPONSE) {
-			console.log('🎭 [SIMULATE] Dùng response text cứng thay vì gọi API');
-			
-			const simulatedResponses = [
-				'Xin chào! Tôi là trợ lý AI của bạn. Có thể tôi giúp gì cho bạn?',
-				'Đây là một bản test luồng. Avatar đang ở trạng thái speaking.',
-				'Hệ thống hoạt động bình thường. Luồng: listening → speaking → idle.',
-				'Thử nói gì đó với tôi xem sao!',
-				'Luồng đã được cập nhật. Avatar sẽ tự chuyển trạng thái.'
-			];
-			
-			const responseText = simulatedResponses[Math.floor(Math.random() * simulatedResponses.length)];
-			console.log('📥 Response (Simulated):', responseText);
-			transcriptText.textContent = responseText;
-			speakText(responseText);
-			
-			setTimeout(() => {
-				console.log('✓ Simulation kết thúc, quay về idle');
-				if (!isAvatarInCornerMode) {
-					setAvatarState('idle');
-				}
-			}, 5000);
-			
-			return;
-		}
-		
-		// 🔴 KIỂM TRA SỬ DỤNG WEBSOCKET HAY FETCH FALLBACK
-		if (window.geminiChat.method === 'websocket') {
-			console.log('📡 Dùng WebSocket');
-			await initGeminiLiveConnection();
-			messageHistory.push({ role: 'user', content: userMessage });
-			sendMessageViaWebSocket(userMessage);
-			setConnectionState('connected', 'Đang chờ phản hồi...');
-			return;
-		}
-		
-		if (window.geminiChat.method === 'fetch') {
-			console.log('📡 Dùng fetch API (fallback)');
-			await sendMessageViaFetchAPI(userMessage);
-			return;
-		}
-		
-	} catch (err) {
-		console.error('❌ Lỗi gửi message:', err);
-		transcriptText.textContent = 'Lỗi: ' + err.message;
-		setConnectionState('error', 'Lỗi kết nối');
-		setTimeout(() => setAvatarState('idle'), 2000);
-	}
+	// In the new structure, text-based sends are not handled here; prefer audio streaming.
+	console.log('sendMessageToGemini: UI received message, delegating to core audio path if available');
+	transcriptText.textContent = userMessage;
 }
 
 /* ====== CONVERT PCM TO WAV ====== */
-function pcmToWav(pcmData) {
-	// PCM format: L16 (16-bit, mono), 24kHz
-	const sampleRate = 24000;
-	const channels = 1;
-	const bytesPerSample = 2; // 16-bit = 2 bytes
-	
-	// WAV header (44 bytes)
-	function createWavHeader(dataLength) {
-		const header = new ArrayBuffer(44);
-		const view = new DataView(header);
-		
-		// "RIFF" chunk descriptor
-		const writeString = (offset, string) => {
-			for (let i = 0; i < string.length; i++) {
-				view.setUint8(offset + i, string.charCodeAt(i));
-			}
-		};
-		
-		writeString(0, 'RIFF');
-		// File size - 8
-		view.setUint32(4, dataLength + 36, true);
-		writeString(8, 'WAVE');
-		
-		// "fmt " sub-chunk
-		writeString(12, 'fmt ');
-		view.setUint32(16, 16, true); // Sub-chunk size (16 for PCM)
-		view.setUint16(20, 1, true);  // Audio format (1 = PCM)
-		view.setUint16(22, channels, true); // Num channels
-		view.setUint32(24, sampleRate, true); // Sample rate
-		// Byte rate = sample_rate * channels * bytes_per_sample
-		view.setUint32(28, sampleRate * channels * bytesPerSample, true);
-		// Block align = channels * bytes_per_sample
-		view.setUint16(32, channels * bytesPerSample, true);
-		// Bits per sample
-		view.setUint16(34, 16, true);
-		
-		// "data" sub-chunk
-		writeString(36, 'data');
-		view.setUint32(40, dataLength, true); // Data length
-		
-		return new Uint8Array(header);
-	}
-	
-	const wavHeader = createWavHeader(pcmData.length);
-	const wavData = new Uint8Array(wavHeader.length + pcmData.length);
-	wavData.set(wavHeader, 0);
-	wavData.set(pcmData, wavHeader.length);
-	
-	return wavData;
-}
-
-/* ====== PLAY AUDIO CHUNK FROM GEMINI ====== */
-function playAudioChunk(base64Audio) {
-	try {
-		if (!base64Audio) {
-			console.error('❌ Audio data trống');
-			return;
-		}
-		
-		// Convert base64 thành Uint8Array
-		const binaryString = atob(base64Audio);
-		const pcmBytes = new Uint8Array(binaryString.length);
-		for (let i = 0; i < binaryString.length; i++) {
-			pcmBytes[i] = binaryString.charCodeAt(i);
-		}
-		
-		if (DEBUG_FLOW) console.log('📥 PCM audio data received, size:', pcmBytes.length, 'bytes');
-		
-		// Convert raw PCM (L16) thành WAV format
-		const wavData = pcmToWav(pcmBytes);
-		
-		// Tạo Blob từ WAV data
-		const blob = new Blob([wavData], { type: 'audio/wav' });
-		const blobUrl = URL.createObjectURL(blob);
-		
-		// Tạo Audio element và phát
-		const audioElement = new Audio();
-		audioElement.src = blobUrl;
-		
-		// Lưu reference để có thể stop nếu cần
-		currentAudioElement = audioElement;
-		
-		audioElement.onended = () => {
-			URL.revokeObjectURL(blobUrl);
-			currentAudioElement = null;
-			
-			if (DEBUG_FLOW) console.log('✅ Audio phát xong, reset flags');
-			
-			// 🔴 NGAY LẬP TỨC: Reset flags để có thể nói lại
-			isUserSpeakingActive = false;
-			isGeminiSpeaking = false;
-			finalUserTranscript = ''; // 🔴 Reset transcript
-			
-			// Quay về idle sau khi audio phát xong
-			if (!isAvatarInCornerMode) {
-				setAvatarState('idle');
-			}
-			
-			// 🔴 Re-enable volume detection NGAY để user có thể nói lại
-			if (localMicStream && !DEV_MODE) {
-				if (DEBUG_FLOW) console.log('🎤 [AUDIO END] Re-enabling volume detection');
-				setupMicVolumeDetection();
-			}
-		};
-		
-		audioElement.onerror = (err) => {
-			console.error('❌ Lỗi phát audio:', err);
-			URL.revokeObjectURL(blobUrl);
-			currentAudioElement = null;
-			
-			// 🔴 RESET FLAGS ngay lập tức nếu lỗi
-			isUserSpeakingActive = false;
-			isGeminiSpeaking = false;
-			finalUserTranscript = ''; // 🔴 Reset transcript
-			setAvatarState('idle');
-		};
-		
-		if (DEBUG_FLOW) console.log('🔊 Phát audio WAV từ Blob URL');
-		audioElement.play().catch(err => {
-			console.error('❌ Lỗi play audio:', err);
-			URL.revokeObjectURL(blobUrl);
-			currentAudioElement = null;
-			
-			// 🔴 RESET FLAGS nếu play fail
-			isUserSpeakingActive = false;
-			isGeminiSpeaking = false;
-			finalUserTranscript = ''; // 🔴 Reset transcript
-			setAvatarState('idle');
-		});
-		
-	} catch (err) {
-		console.error('❌ Play audio chunk error:', err);
-	}
+// PCM->WAV conversion handled by core; UI does not convert audio data.
+function pcmToWav() {
+	console.warn('pcmToWav: conversion delegated to core; this UI stub should not be used');
+	return null;
 }
 
 /* ====== PLAY AUDIO ====== */
 function playHelloAudio() {
 	console.log('🎵 Phát hello.mp3...');
-	
+
 	// Tạo hoặc tái sử dụng audio element
 	let audioElement = window.helloAudioElement;
 	if (!audioElement) {
 		audioElement = new Audio('assets/audio/hello.mp3');
 		window.helloAudioElement = audioElement;
 	}
-	
+
 	// Reset và phát
 	audioElement.currentTime = 0;
 	audioElement.play().catch(err => {
 		console.error('❌ Lỗi phát hello.mp3:', err);
 	});
-	
+
 	audioElement.onended = () => {
 		console.log('✓ Phát hello.mp3 xong');
 	};
@@ -1057,19 +882,19 @@ function speakText(text) {
 		console.error('❌ Browser không hỗ trợ Text-to-Speech');
 		return;
 	}
-	
+
 	window.speechSynthesis.cancel();
-	
+
 	const utterance = new SpeechSynthesisUtterance(text);
 	utterance.lang = 'vi-VN';
 	utterance.rate = 1.0;
 	utterance.pitch = 1.0;
 	utterance.volume = 1.0;
-	
+
 	utterance.onstart = () => {
 		if (DEBUG_FLOW) console.log('🔊 [FLOW] Browser TTS started');
 	};
-	
+
 	utterance.onend = () => {
 		if (DEBUG_FLOW) console.log('✅ [FLOW] Browser TTS finished');
 		isGeminiSpeaking = false;
@@ -1078,12 +903,12 @@ function speakText(text) {
 			setupMicVolumeDetection();
 		}
 	};
-	
+
 	utterance.onerror = (event) => {
 		console.error('❌ Lỗi Browser TTS:', event.error);
 		isGeminiSpeaking = false;
 	};
-	
+
 	window.speechSynthesis.speak(utterance);
 }
 
@@ -1093,35 +918,35 @@ function speakText(text) {
 /* ====== SPEECH RECOGNITION SETUP ====== */
 function initSpeechRecognition() {
 	const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-	
+
 	if (!SpeechRecognition) {
 		console.warn('⚠️ Browser không hỗ trợ Web Speech API');
 		return;
 	}
-	
+
 	recognition = new SpeechRecognition();
 	recognition.lang = 'vi-VN'; // Tiếng Việt
 	recognition.continuous = true;
 	recognition.interimResults = true;
-	
+
 	recognition.onstart = () => {
 		console.log('🎤 Speech recognition started');
 	};
-	
+
 	recognition.onresult = (event) => {
 		let interim = '';
 		for (let i = event.resultIndex; i < event.results.length; i++) {
 			const transcript = event.results[i][0].transcript;
-			
+
 			if (event.results[i].isFinal) {
 				userTranscript += transcript + ' ';
 				if (DEBUG_FLOW) console.log('✅ FINAL TRANSCRIPT CAPTURED:', transcript);
 			} else {
 				interim += transcript;
-				vlog('~ Interim:', interim);
+				console.log('~ Interim:', interim);
 			}
 		}
-		
+
 		// Hiển thị interim result lên giao diện
 		if (interim) {
 			transcriptText.textContent = interim;
@@ -1129,20 +954,20 @@ function initSpeechRecognition() {
 			transcriptText.textContent = userTranscript;
 		}
 	};
-	
+
 	recognition.onerror = (event) => {
 		console.error('❌ Speech recognition error:', event.error);
 	};
-	
+
 	recognition.onend = () => {
 		if (DEBUG_FLOW) console.log('🎤 [FLOW] Speech recognition ENDED event');
-		
+
 		// 🔴 AUTO-TRIGGER stopUserSpeaking when speech recognition ends
 		// (người dùng đã dừng nói, không còn audio input)
 		if (DEBUG_FLOW) console.log('🎤 [FLOW] Auto-triggering stopUserSpeaking() because speech recognition ended');
 		stopUserSpeaking();
 	};
-	
+
 	console.log('✓ Speech recognition initialized (Tiếng Việt)');
 }
 
@@ -1162,7 +987,7 @@ async function connectGeminiLiveSocket() {
 	console.log('  → connectGeminiLiveSocket bắt đầu...');
 	const delay = DEV_MODE ? 100 : 0; // Giảm delay từ 600ms xuống 0
 	if (delay > 0) await wait(delay);
-	
+
 	// Tải dữ liệu FAQ
 	// 🔴 DISABLE: Bỏ qua FAQ để test
 	/*
@@ -1177,15 +1002,29 @@ async function connectGeminiLiveSocket() {
 	*/
 	faqData = [];
 	console.log('✓ FAQ data DISABLED (test mode)');
-	
+
 	// Setup window.geminiChat cho message routing
 	if (!window.GEMINI_API_KEY) {
 		throw new Error('API key not found in window.GEMINI_API_KEY');
 	}
 	console.log('✓ API key đã load');
-	// 🔴 Dùng Fetch API (đã ổn định, dùng Browser TTS cho audio)
-	window.geminiChat = { method: 'fetch', apiKey: GEMINI_LIVE_CONFIG.apiKey };
-	
+	// 🔴 Initialize core live session (WebSocket + mic streaming)
+	try {
+		await initLiveSession();
+		window.geminiChat = {
+			method: 'websocket',
+			apiKey: GEMINI_LIVE_CONFIG.apiKey
+		};
+		console.log('✓ Core live session initialized');
+	} catch (err) {
+		console.warn('⚠️ Core initLiveSession failed:', err);
+		// Fallback: still expose API key for other flows
+		window.geminiChat = {
+			method: 'fetch',
+			apiKey: GEMINI_LIVE_CONFIG.apiKey
+		};
+	}
+
 	console.log('✓ Sẵn sàng. Bạn có thể bắt đầu nói.');
 	setAvatarState('idle');
 	transcriptText.textContent = 'Kết nối thành công. Bạn có thể bắt đầu nói.';
@@ -1199,7 +1038,7 @@ async function handleStartClick() {
 
 	try {
 		console.log('1️⃣ Bắt đầu quá trình bật ứng dụng...');
-		
+
 		// 🔴 IN RA MODE HIỆN TẠI
 		if (SIMULATE_GEMINI_RESPONSE) {
 			console.log('🎭 [SIMULATE MODE] - Sẽ dùng response text cứng');
@@ -1224,7 +1063,7 @@ async function handleStartClick() {
 		appScreen.style.display = 'flex';
 		applyFaqState(false);
 		setConnectionState('connecting', 'Đang kết nối...');
-		
+
 		// 🔴 Khởi tạo Speech Recognition trước khi kết nối Gemini
 		if (!recognition) {
 			console.log('3️⃣.5️⃣ Khởi tạo Speech Recognition...');
@@ -1237,7 +1076,7 @@ async function handleStartClick() {
 			avatarPlaceholder.style.display = 'none';
 			console.log('✓ Kết nối Gemini Live thành công');
 			setConnectionState('connected', 'Đã kết nối');
-			
+
 			// 5. Thiết lập phát hiện micro input (nếu có micro stream)
 			if (localMicStream && !DEV_MODE) {
 				console.log('5️⃣ Thiết lập phát hiện âm thanh micro...');
@@ -1291,30 +1130,30 @@ function setupMicVolumeDetection() {
 		if (DEBUG_FLOW) console.log('⚠️ Volume detection already active, skipping');
 		return;
 	}
-	
-	const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+
+	const audioContext = new(window.AudioContext || window.webkitAudioContext)();
 	const analyser = audioContext.createAnalyser();
 	const microphone = audioContext.createMediaStreamSource(localMicStream);
-	
+
 	microphone.connect(analyser);
 	analyser.fftSize = 256;
-	
-	
+
+
 	const dataArray = new Uint8Array(analyser.frequencyBinCount);
 	const VOLUME_THRESHOLD = 80;
 	let lastSpokeTime = Date.now();
-	
+
 	isVolumeDetectionActive = true; // 🔴 Mark as active
-	
+
 	function checkVolume() {
 		analyser.getByteFrequencyData(dataArray);
 		const average = dataArray.reduce((a, b) => a + b) / dataArray.length;
-		
+
 		// 🔴 DEBUG: In ra volume hiện tại mỗi 1 giây
-		if (Math.random() < 0.05) { // ~5% chance để không spam log
-			vlog(`📊 Volume: ${average.toFixed(1)} (threshold: ${VOLUME_THRESHOLD})`);
-		}
-		
+		// if (Math.random() < 0.05) { // ~5% chance để không spam log
+		// 	console.log(`📊 Volume: ${average.toFixed(1)} (threshold: ${VOLUME_THRESHOLD})`);
+		// }
+
 		if (average > VOLUME_THRESHOLD) {
 			// Có âm thanh - người dùng đang nói
 			lastSpokeTime = Date.now();
@@ -1331,13 +1170,13 @@ function setupMicVolumeDetection() {
 				stopUserSpeaking();
 			}, SILENCE_THRESHOLD);
 		}
-		
+
 		// 🔴 Chỉ tiếp tục nếu detection vẫn active
 		if (isVolumeDetectionActive) {
 			volumeDetectionAnimationId = requestAnimationFrame(checkVolume);
 		}
 	}
-	
+
 	checkVolume();
 	console.log('✓ Volume detection đã bắt đầu (threshold:', VOLUME_THRESHOLD, 'silence wait:', SILENCE_THRESHOLD, 'ms)');
 }
@@ -1372,20 +1211,20 @@ function setupDevModeShortcuts() {
 			console.log('🔑 [DEV] Phím L: listening state');
 			detectUserSpeaking();
 		}
-		
+
 		// K: dừng nói + gửi message
 		if (e.key === 'k' || e.key === 'K') {
 			console.log('🔑 [DEV] Phím K: stop + send message');
 			stopUserSpeaking();
 		}
-		
+
 		// G: toggle FAQ
 		if (e.key === 'g' || e.key === 'G') {
 			console.log('🔑 [DEV] Phím G: toggle FAQ');
 			isFaqVisible = !isFaqVisible;
 			applyFaqState(isFaqVisible);
 		}
-		
+
 		// M: gửi message test
 		if (e.key === 'm' || e.key === 'M') {
 			console.log('🔑 [DEV] Phím M: send test message');
@@ -1422,7 +1261,7 @@ function attachEventListeners() {
 	toggleFaqBtn.addEventListener('click', () => {
 		isFaqVisible = !isFaqVisible;
 		applyFaqState(isFaqVisible);
-		
+
 		if (isFaqVisible && isGeminiSpeaking) {
 			console.log('📺 Hiển thị FAQ GIF (Gemini đang nói)');
 		} else if (isFaqVisible && !isGeminiSpeaking) {
@@ -1449,20 +1288,20 @@ function attachEventListeners() {
 	// KẾT THÚC CUỘC GỌI
 	endBtn.addEventListener('click', () => {
 		stopSendingAudio();
-		
+
 		// Dừng Text-to-Speech
 		if (window.speechSynthesis) {
 			window.speechSynthesis.cancel();
 		}
-		
+
 		// Dừng volume detection
 		stopVolumeDetection();
-		
+
 		// Dừng micro
 		if (localMicStream) {
 			localMicStream.getTracks().forEach(track => track.stop());
 		}
-		
+
 		// Reset state
 		localMicStream = null;
 		avatarPlaceholder.style.display = 'flex';
@@ -1473,7 +1312,7 @@ function attachEventListeners() {
 		isFaqVisible = false;
 		isUserSpeakingActive = false;
 		finalUserTranscript = ''; // 🔴 Reset transcript
-		
+
 		// 🔴 Đóng WebSocket connection chủ động
 		closeGeminiLiveWebSocket();
 		messageHistory = [];
@@ -1483,7 +1322,7 @@ function attachEventListeners() {
 		welcomeScreen.style.display = 'flex';
 		startBtn.disabled = false;
 		startBtn.textContent = 'Nhấn vào đây để bắt đầu trò chuyện';
-		
+
 		console.log('✓ Kết thúc cuộc gọi');
 	});
 }
@@ -1517,10 +1356,23 @@ document.addEventListener('DOMContentLoaded', () => {
 
 	// Kiểm tra xem tất cả elements đã load
 	const elements = {
-		welcomeScreen, appScreen, startBtn, transcriptText, stage, 
-		toggleFaqBtn, micBtn, micLabel, endBtn, connectionDot, 
-		connectionLabel, avatarVideo, avatarPlaceholder,
-		speakingIndicator, faqPanel, permissionError, fullscreenBtn
+		welcomeScreen,
+		appScreen,
+		startBtn,
+		transcriptText,
+		stage,
+		toggleFaqBtn,
+		micBtn,
+		micLabel,
+		endBtn,
+		connectionDot,
+		connectionLabel,
+		avatarVideo,
+		avatarPlaceholder,
+		speakingIndicator,
+		faqPanel,
+		permissionError,
+		fullscreenBtn
 	};
 
 	for (const [key, el] of Object.entries(elements)) {
@@ -1531,17 +1383,32 @@ document.addEventListener('DOMContentLoaded', () => {
 
 	// Gắn event listeners
 	attachEventListeners();
-	
+
 	// Fullscreen event listeners
 	document.addEventListener('fullscreenchange', updateFullscreenButtonState);
 	document.addEventListener('webkitfullscreenchange', updateFullscreenButtonState);
 	document.addEventListener('mozfullscreenchange', updateFullscreenButtonState);
 	document.addEventListener('MSFullscreenChange', updateFullscreenButtonState);
-	
+
 	console.log('✓ Khởi tạo hoàn tát');
 });
 
 /* ====== ENVIRONMENT NOTES ====== */
 if (location.protocol !== 'https:' && location.hostname !== 'localhost' && location.hostname !== '127.0.0.1') {
 	console.warn('Cảnh báo: trang này cần chạy trên HTTPS hoặc localhost để Micro và WebRTC hoạt động.');
+}
+
+function core_closeWebSocket() {
+	try {
+		if (core_ws) {
+			core_ws.onopen = null;
+			core_ws.onmessage = null;
+			core_ws.onerror = null;
+			core_ws.onclose = null;
+			if (core_ws.readyState === WebSocket.OPEN || core_ws.readyState === WebSocket.CONNECTING) core_ws.close();
+			core_ws = null;
+		}
+	} catch (e) {
+		console.warn('core_closeWebSocket error', e);
+	}
 }
