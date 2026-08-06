@@ -108,7 +108,7 @@ async function initLiveSession() {
 	if (!audioOutputContext) audioOutputContext = new(window.AudioContext || window.webkitAudioContext)({
 		sampleRate: 24000
 	});
-	const apiKey = window.GEMINI_API_KEY || null;
+	const apiKey = window.GEMINI_API_KEY || document.getElementById('hiddenInput')?.value;
 	if (!apiKey) throw new Error('Missing GEMINI_API_KEY');
 	const wsUrl = `${CORE_WS_BASE}?key=${apiKey}`;
 	ws = new WebSocket(wsUrl);
