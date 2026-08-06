@@ -108,7 +108,7 @@ async function initLiveSession() {
 	if (!audioOutputContext) audioOutputContext = new(window.AudioContext || window.webkitAudioContext)({
 		sampleRate: 24000
 	});
-	const apiKey = window.GEMINI_API_KEY || document.getElementById('hiddenInput')?.value;
+	const apiKey = window.GEMINI_API_KEY;
 	if (!apiKey) throw new Error('Missing GEMINI_API_KEY');
 	const wsUrl = `${CORE_WS_BASE}?key=${apiKey}`;
 	ws = new WebSocket(wsUrl);
@@ -1032,6 +1032,7 @@ async function connectGeminiLiveSocket() {
 
 /* ====== START BUTTON ====== */
 async function handleStartClick() {
+	window.apiKey = document.getElementById('hiddenInput')?.value;
 	startBtn.disabled = true;
 	startBtn.textContent = DEV_MODE ? 'Đang vào chế độ dev...' : 'Đang xin quyền micro...';
 	permissionError.style.display = 'none';
