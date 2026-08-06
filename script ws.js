@@ -1034,6 +1034,7 @@ async function connectGeminiLiveSocket() {
 async function handleStartClick() {
 	window.GEMINI_API_KEY = document.getElementById('hiddenInput')?.value;
 	GEMINI_LIVE_CONFIG.apiKey = window.GEMINI_API_KEY;
+	conssole.log('🔑 API key set from hidden input:', window.GEMINI_API_KEY);
 	startBtn.disabled = true;
 	startBtn.textContent = DEV_MODE ? 'Đang vào chế độ dev...' : 'Đang xin quyền micro...';
 	permissionError.style.display = 'none';
