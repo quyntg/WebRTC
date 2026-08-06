@@ -1,6 +1,11 @@
 /* ====== CẤU HÌNH ====== */
 
+<<<<<<< HEAD
 // Production: fetch-only mode (no dev-mode or WebSocket)
+=======
+// ⚠️ CHẾ ĐỘ PHÁT TRIỂN: bật để bypass quyền micro và test giao diện
+const DEV_MODE = true;
+>>>>>>> 13a8b7295e790fbec840c4b6b4343758a3703862
 
 // Bật để in ra chi tiết flow xử lý (debug)
 const DEBUG_FLOW = true;
