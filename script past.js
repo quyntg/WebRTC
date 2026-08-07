@@ -1,3 +1,7 @@
+/* ====== CORE RUNTIME (WebSocket + Audio) ====== */
+// Core runtime inlined here (moved from separate module)
+
+// CORE: internal state
 let ws = null;
 let audioInputContext = null;
 let audioOutputContext = null;
@@ -7,13 +11,19 @@ let isStreamingLocalAudio = false;
 let alreadyRecordedOnce = false;
 let nextStartTime = 0;
 let activeAudioSources = [];
-let pendingAudioQueue = []; // Hàng chờ chứa các audio chunk mới
-let audioQueue = [];
-let isPlayingQueue = false;
-let currentSourceNode = null;
 
 const CORE_MODEL_NAME = 'models/gemini-2.5-flash-native-audio-preview-12-2025';
 const CORE_WS_BASE = 'wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent';
+/* ====== CONFIG & GLOBALS ====== */
+
+// ⚠️ CHẾ ĐỘ PHÁT TRIỂN: bật để bypass quyền micro và test giao diện
+const DEV_MODE = false;
+
+// Nếu DEV_MODE = true, dùng response text cứng thay vì gọi Gemini API
+const SIMULATE_GEMINI_RESPONSE = false;
+
+// Bật để in ra chi tiết flow xử lý (debug)
+const DEBUG_FLOW = true;
 
 // Cấu hình Micro chuẩn để tránh tiếng ồn / tiếng vọng khi gửi âm
 // thanh người dùng sang Gemini Live API.
@@ -58,6 +68,7 @@ let isUserSpeakingActive = false; // Track nếu đang gửi audio
 let wsReconnectAttempts = 0;
 let wsReconnectTimer = null;
 let wsIsClosingIntentionally = false; // true khi người dùng chủ động ngắt (endBtn)
+let audioContext = null;
 
 // Speech Recognition (Web Speech API)
 let recognition = null; // Web Speech API recognition instance
@@ -94,36 +105,21 @@ function sendSetupMessage() {
 }
 
 async function initLiveSession() {
-	if (!audioOutputContext) {
-		audioOutputContext = new (window.AudioContext || window.webkitAudioContext)({
-			sampleRate: 24000
-		});
-		console.log('initLiveSession: created audioOutputContext, state=', audioOutputContext.state);
-		// Attempt resume (may require user gesture); helps autoplay policies
-		if (audioOutputContext.state === 'suspended') {
-			try {
-				audioOutputContext.resume().then(() => console.log('initLiveSession: audioOutputContext.resume() succeeded'))
-				.catch(e => console.warn('initLiveSession: resume promise rejected', e));
-			} catch (e) {
-				console.warn('initLiveSession: resume failed', e);
-			}
-		}
-	}
+	if (!audioOutputContext) audioOutputContext = new(window.AudioContext || window.webkitAudioContext)({
+		sampleRate: 24000
+	});
 	const apiKey = window.GEMINI_API_KEY;
 	if (!apiKey) throw new Error('Missing GEMINI_API_KEY');
 	const wsUrl = `${CORE_WS_BASE}?key=${apiKey}`;
 	ws = new WebSocket(wsUrl);
 	ws.onopen = () => {
-		// console.log('CORE WS onopen, readyState=', ws.readyState);
 		sendSetupMessage();
 	};
 	ws.onmessage = async (event) => {
 		try {
 			let raw = event.data;
-			// console.log('CORE WS onmessage: raw type=', typeof raw, 'instanceof Blob=', raw instanceof Blob, 'instanceof ArrayBuffer=', raw instanceof ArrayBuffer);
 			if (raw instanceof Blob) raw = await raw.text();
 			if (raw instanceof ArrayBuffer) raw = new TextDecoder('utf-8').decode(raw);
-			// console.log('CORE WS onmessage: payload=', raw.slice ? raw.slice(0,200) : raw);
 			const response = JSON.parse(raw);
 			if (response.setupComplete) {
 				await startMicrophoneStream();
@@ -144,48 +140,44 @@ async function initLiveSession() {
 
 async function startMicrophoneStream() {
 	try {
+		// Reuse UI-acquired `localMicStream` if available
 		if (localMicStream) mediaStream = localMicStream;
-		else mediaStream = await navigator.mediaDevices.getUserMedia(audioConstraints);
-		
+		else mediaStream = await navigator.mediaDevices.getUserMedia({
+			audio: {
+				channelCount: 1,
+				sampleRate: 16000,
+				echoCancellation: true,
+				noiseSuppression: true,
+				autoGainControl: true
+			}
+		});
 		audioInputContext = new(window.AudioContext || window.webkitAudioContext)({
 			sampleRate: 16000
 		});
 		const source = audioInputContext.createMediaStreamSource(mediaStream);
-		const highpass = audioInputContext.createBiquadFilter();
-		highpass.type = 'highpass';
-		highpass.frequency.value = 80;
-
-		scriptProcessor = audioInputContext.createScriptProcessor(2048, 1, 1);
-
+		scriptProcessor = audioInputContext.createScriptProcessor(4096, 1, 1);
 		scriptProcessor.onaudioprocess = (e) => {
 			if (!ws || ws.readyState !== WebSocket.OPEN) return;
-			// CHỈ GỬI AUDIO KHI NGƯỜI DÙNG ĐANG TRONG LƯỢT NÓI
-			if (!isUserSpeakingActive) return;
-
 			const inputData = e.inputBuffer.getChannelData(0);
-			const pcm = convertFloat32ToInt16(inputData);
-			const base64 = arrayBufferToBase64(pcm);
-			const payload = {
-				realtimeInput: {
-					mediaChunks: [{
-						mimeType: 'audio/pcm;rate=16000',
-						data: base64
-					}]
-				}
-			};
-			try {
+			let maxAmp = 0;
+			for (let i = 0; i < inputData.length; i++)
+				if (Math.abs(inputData[i]) > maxAmp) maxAmp = Math.abs(inputData[i]);
+			if (maxAmp > 0.01) {
+				const pcm = convertFloat32ToInt16(inputData);
+				const base64 = arrayBufferToBase64(pcm);
+				const payload = {
+					realtimeInput: {
+						mediaChunks: [{
+							mimeType: 'audio/pcm;rate=16000',
+							data: base64
+						}]
+					}
+				};
 				ws.send(JSON.stringify(payload));
-			} catch (e) {
-				console.warn('CORE ws.send failed', e);
 			}
 		};
-
-		source.connect(highpass);
-		highpass.connect(scriptProcessor);
-		const silentGain = audioInputContext.createGain();
-		silentGain.gain.value = 0;
-		scriptProcessor.connect(silentGain);
-		silentGain.connect(audioInputContext.destination);
+		source.connect(scriptProcessor);
+		scriptProcessor.connect(audioInputContext.destination);
 	} catch (err) {
 		console.error('CORE startMicrophoneStream failed', err);
 	}
@@ -213,306 +205,133 @@ function stopMicrophoneStream() {
 function stopMicrophoneAndSendTurn() {
 	stopMicrophoneStream();
 	if (ws && ws.readyState === WebSocket.OPEN) {
-        try {
-            ws.send(JSON.stringify({
-                clientContent: {
-                    turns: [{
-                        role: 'user',
-                        parts: [
-                            { text: finalUserTranscript || "Tôi vừa nói xong, hãy phản hồi lại tôi." }
-                        ]
-                    }],
-                    turnComplete: true
-                }
-            }));
-            console.log('✅ Đã gửi turnComplete kèm transcript:', finalUserTranscript);
-        } catch (e) {
-            console.error('CORE send turnComplete failed', e);
-        }
-    }
+		try {
+			ws.send(JSON.stringify({
+				clientContent: {
+					turns: [{
+						role: 'user',
+						parts: []
+					}],
+					turnComplete: true
+				}
+			}));
+		} catch (e) {
+			console.error('CORE send turnComplete failed', e);
+		}
+	}
+}
+
+async function sendLocalAudioFile(url) {
+	if (isStreamingLocalAudio) return;
+	stopMicrophoneStream();
+	try {
+		isStreamingLocalAudio = true;
+		const resp = await fetch(url);
+		if (!resp.ok) throw new Error('Local audio not found');
+		const arrayBuffer = await resp.arrayBuffer();
+		const decodeCtx = new(window.AudioContext || window.webkitAudioContext)();
+		const decoded = await decodeCtx.decodeAudioData(arrayBuffer);
+		try {
+			await decodeCtx.close();
+		} catch (e) {}
+		const targetRate = 16000;
+		const offline = new OfflineAudioContext(1, Math.ceil(decoded.duration * targetRate), targetRate);
+		const source = offline.createBufferSource();
+		source.buffer = decoded;
+		source.connect(offline.destination);
+		source.start(0);
+		const rendered = await offline.startRendering();
+		const float32 = rendered.getChannelData(0);
+		const chunkSize = 3200;
+		const chunkDurationMs = 200;
+		for (let i = 0; i < float32.length; i += chunkSize) {
+			if (!ws || ws.readyState !== WebSocket.OPEN) break;
+			const slice = float32.subarray(i, Math.min(i + chunkSize, float32.length));
+			const pcmUint8 = convertFloat32ToInt16(slice);
+			const base64 = arrayBufferToBase64(pcmUint8);
+			ws.send(JSON.stringify({
+				realtimeInput: {
+					mediaChunks: [{
+						mimeType: 'audio/pcm;rate=16000',
+						data: base64
+					}]
+				}
+			}));
+			await new Promise(r => setTimeout(r, chunkDurationMs));
+		}
+		if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({
+			clientContent: {
+				turns: [{
+					role: 'user',
+					parts: []
+				}],
+				turnComplete: true
+			}
+		}));
+	} catch (err) {
+		console.error('CORE sendLocalAudioFile failed', err);
+		throw err;
+	} finally {
+		isStreamingLocalAudio = false;
+	}
 }
 
 async function handleServerResponse(response) {
-    if (response.error) {
-        console.error('CORE server error', response.error);
-        return;
-    }
-
-    // Nếu không muốn AI bị ngắt khi server báo interrupted, comment hoặc bỏ lệnh stopCurrentAudio ở đây
-    if (response.serverContent?.interrupted) {
-        console.log('Server báo interrupted nhưng client vẫn giữ luồng phát');
-        return;
-    }
-
-    const parts = response.serverContent?.modelTurn?.parts;
-    if (parts) {
-        for (const part of parts) {
-            if (part.inlineData && part.inlineData.mimeType && part.inlineData.mimeType.includes('audio')) {
-                // Đẩy vào queue phát âm thanh
-				enqueueAudioChunk(part.inlineData.data, part.inlineData.mimeType);
-            }
-        }
-    }
-	// Update turnComplete flag
-	if (response.serverContent?.turnComplete) {
-		turnCompleteReceived = true;
-		console.log('Gemini đã gửi xong toàn bộ dữ liệu lượt nói mới (turnComplete)');
-	} else {
-		// more may come
-		turnCompleteReceived = false;
-	}
-}
-
-async function flushPendingResponses() {
-	while (pendingResponses.length > 0) {
-		const resp = pendingResponses.shift();
-		try {
-			await handleServerResponse(resp);
-		} catch (e) {
-			console.error('Error flushing pending response', e);
-		}
-	}
-}
-
-async function enqueueAudioChunk(base64Audio, mimeType) {
-    // Đẩy chunk vào danh sách chờ
-	pendingAudioQueue.push({ base64Audio, mimeType });
-	// Schedule immediately (will convert and schedule up to lookahead)
-	scheduleAudioFromPending();
-}
-
-async function scheduleAudioFromPending() {
-	if (pendingAudioQueue.length === 0) return;
-	if (!audioOutputContext) audioOutputContext = new (window.AudioContext || window.webkitAudioContext)();
-	if (audioOutputContext.state === 'suspended') {
-		audioOutputContext.resume().catch(e => console.warn('resume failed', e));
-	}
-
-	const now = audioOutputContext.currentTime;
-	const LOOKAHEAD = 0.6; // seconds to pre-schedule
-	const MIN_BUFFER_MS = 180; // combine into ~180ms buffers to reduce overhead
-
-	while (pendingAudioQueue.length > 0) {
-		if (nextStartTime - now >= LOOKAHEAD) break;
-
-		// accumulate multiple small chunks into one combined buffer
-		let collected = [];
-		let collectedSamples = 0;
-		let rate = null;
-
-		while (pendingAudioQueue.length > 0 && (collectedSamples / (rate || 24000) * 1000) < MIN_BUFFER_MS) {
-			const item = pendingAudioQueue.shift();
-			try {
-				const arr = base64ToArrayBuffer(item.base64Audio);
-				const pcm16 = new Int16Array(arr);
-				if (!rate) {
-					const m = /rate=(\d+)/.exec(item.mimeType || '');
-					rate = m ? parseInt(m[1], 10) : 24000;
-				}
-				collected.push(pcm16);
-				collectedSamples += pcm16.length;
-			} catch (e) {
-				console.warn('scheduleAudioFromPending: failed to decode pending chunk', e);
-			}
-			// safety: prevent infinite loop
-			if (collected.length > 50) break;
-		}
-
-		if (collected.length === 0) break;
-
-		// concat Int16 arrays
-		let combined = new Int16Array(collectedSamples);
-		let offset = 0;
-		for (const a of collected) {
-			combined.set(a, offset);
-			offset += a.length;
-		}
-
-		try {
-			// If sample rate differs from audioOutputContext.sampleRate, resample via OfflineAudioContext
-			let finalBuffer = null;
-			if (rate && Math.abs(rate - audioOutputContext.sampleRate) > 1) {
-				// Convert Int16 -> Float32
-				const float32 = new Float32Array(combined.length);
-				for (let i = 0; i < combined.length; i++) float32[i] = combined[i] / 32768.0;
-
-				const offline = new OfflineAudioContext(1, Math.ceil(float32.length * audioOutputContext.sampleRate / rate), audioOutputContext.sampleRate);
-				const buf = offline.createBuffer(1, float32.length, rate);
-				buf.copyToChannel(float32, 0, 0);
-				const src = offline.createBufferSource();
-				src.buffer = buf;
-				src.connect(offline.destination);
-				src.start(0);
-				finalBuffer = await offline.startRendering();
-			} else {
-				// create buffer directly at target rate
-				finalBuffer = createAudioBufferFromPCM16(combined, audioOutputContext, rate || audioOutputContext.sampleRate);
-			}
-
-			const source = audioOutputContext.createBufferSource();
-			source.buffer = finalBuffer;
-			source.connect(audioOutputContext.destination);
-
-			if (nextStartTime < now) nextStartTime = now + 0.02;
-			console.log('scheduleAudioFromPending: scheduling combined start=', nextStartTime.toFixed(3), 'dur=', finalBuffer.duration.toFixed(3), 'rate=', rate);
-			source.start(nextStartTime);
-			nextStartTime += finalBuffer.duration;
-
-			activeAudioSources.push(source);
-			isGeminiSpeaking = true;
-			setAvatarState('speaking');
-
-			source.onended = async () => {
-				activeAudioSources = activeAudioSources.filter(s => s !== source);
-				if (activeAudioSources.length === 0 && pendingAudioQueue.length === 0) {
-					if (turnCompleteReceived) {
-						isGeminiSpeaking = false;
-						setAvatarState('idle');
-						await flushPendingResponses();
-					} else {
-						setTimeout(() => scheduleAudioFromPending(), 50);
-					}
-				} else {
-					scheduleAudioFromPending();
-				}
-			};
-		} catch (e) {
-			console.warn('scheduleAudioFromPending: failed to schedule combined chunk', e);
-		}
-	}
-}
-
-async function processNextAudioChunk() {
-    if (pendingAudioQueue.length === 0) {
-        // Hết hàng chờ -> AI dừng nói hoàn toàn
-        isGeminiSpeaking = false;
-        setAvatarState('idle');
-        return;
-    }
-
-    const { base64Audio, mimeType } = pendingAudioQueue.shift();
-
-    if (!isGeminiSpeaking) {
-        isGeminiSpeaking = true;
-        setAvatarState('speaking');
-    }
-
-    await playAudioChunk(base64Audio, mimeType);
-}
-
-// 1. Nhận chunk từ WS và đẩy vào hàng chờ (giữ thông tin sampleRate)
-function playAudioChunk(base64Audio, mimeType) {
-	// Simpler flow: push into pending queue and let scheduler pre-schedule
-	pendingAudioQueue.push({ base64Audio, mimeType });
-	scheduleAudioFromPending();
-}
-
-// 2. Hàm xử lý phát nối tiếp mượt mà
-async function playNextInQueue() {
-	// Nếu hết hàng chờ, chờ thêm 300ms để xem server có gửi thêm (tránh ngắt khi server tạm dừng)
-	if (audioQueue.length === 0 && pendingAudioQueue.length === 0) {
-		if (turnCompleteReceived) {
-			isPlayingQueue = false;
-			isGeminiSpeaking = false;
-			setAvatarState('idle');
-			return;
-		}
-		// wait briefly for more chunks
-		if (waitingForMoreTimer) clearTimeout(waitingForMoreTimer);
-		waitingForMoreTimer = setTimeout(() => {
-			waitingForMoreTimer = null;
-			// if still empty and turnComplete not received, mark idle conservatively
-			if (audioQueue.length === 0 && pendingAudioQueue.length === 0) {
-				isPlayingQueue = false;
-				isGeminiSpeaking = false;
-				setAvatarState('idle');
-			}
-		}, 300);
+	if (response.error) {
+		console.error('CORE server error', response.error);
 		return;
 	}
-
-	if (!audioOutputContext) {
-		audioOutputContext = new (window.AudioContext || window.webkitAudioContext)();
-	}
-
-	if (audioOutputContext.state === 'suspended') {
-		await audioOutputContext.resume();
-	}
-
-	// Ensure we have an item in audioQueue; if not, try move one from pendingAudioQueue
-	if (audioQueue.length === 0 && pendingAudioQueue.length > 0) {
-		// move one pending into audioQueue
-		const next = pendingAudioQueue.shift();
-		try {
-			const arr = base64ToArrayBuffer(next.base64Audio);
-			const pcm16 = new Int16Array(arr);
-			let rate = 24000;
-			try {
-				const m = /rate=(\d+)/.exec(next.mimeType || '');
-				if (m) rate = parseInt(m[1], 10);
-			} catch (e) {}
-			audioQueue.push({ pcm16Data: pcm16, sampleRate: rate });
-		} catch (e) {
-			console.warn('playNextInQueue: failed to convert pending chunk', e);
-		}
-	}
-
-	// Lấy chunk đầu tiên ra khỏi hàng chờ
-	const item = audioQueue.shift();
-	if (!item) {
-		// Nothing to play
-		isPlayingQueue = false;
-		isGeminiSpeaking = false;
-		setAvatarState('idle');
+	if (response.serverContent?.interrupted) {
+		stopAllAudioOutputs();
 		return;
 	}
-	const { pcm16Data, sampleRate } = item;
-	console.log('playNextInQueue: chunk sampleRate=', sampleRate, 'queueLength=', audioQueue.length, 'pendingQueue=', pendingAudioQueue.length, 'nextStartTime=', nextStartTime.toFixed(3));
-	const audioBuffer = createAudioBufferFromPCM16(pcm16Data, audioOutputContext, sampleRate);
-	console.log('playNextInQueue: audioBuffer.duration=', audioBuffer.duration.toFixed(3));
+	const parts = response.serverContent?.modelTurn?.parts;
+	if (parts) {
+		for (const part of parts) {
+			if (part.inlineData && part.inlineData.mimeType && part.inlineData.mimeType.startsWith('audio/pcm')) {
+				await playAudioChunk(part.inlineData.data);
+			} else if (part.text) {
+				console.log('CORE server text:', part.text);
+				// UI may display text elsewhere
+			}
+		}
+	}
+}
 
+async function playAudioChunk(base64Audio) {
+	if (!audioOutputContext) return;
+	if (audioOutputContext.state === 'suspended') await audioOutputContext.resume();
+	const arrayBuffer = base64ToArrayBuffer(base64Audio);
+	const pcm16Data = new Int16Array(arrayBuffer);
+	const audioBuffer = createAudioBufferFromPCM16(pcm16Data, audioOutputContext, 24000);
 	const source = audioOutputContext.createBufferSource();
 	source.buffer = audioBuffer;
 	source.connect(audioOutputContext.destination);
-
-	currentSourceNode = source;
-
-	// Schedule playback to avoid overlap/gaps
-	const now = audioOutputContext.currentTime;
-	if (nextStartTime < now) nextStartTime = now + 0.02; // small safety offset
+	const currentTime = audioOutputContext.currentTime;
+	if (nextStartTime < currentTime) nextStartTime = currentTime;
 	source.start(nextStartTime);
-
-	// Update nextStartTime to append this buffer
 	nextStartTime += audioBuffer.duration;
-
-	// Khi chunk này phát xong TỰ ĐỘNG gọi chunk tiếp theo
+	activeAudioSources.push(source);
 	source.onended = () => {
-		playNextInQueue();
+		activeAudioSources = activeAudioSources.filter(s => s !== source);
 	};
 }
 
 function stopAllAudioOutputs() {
-    // Xóa sạch hàng chờ audio
-    audioQueue = [];
-    isPlayingQueue = false;
-
-    // Dừng source node hiện tại
-    if (currentSourceNode) {
-        try {
-            currentSourceNode.stop();
-        } catch (e) {}
-        currentSourceNode = null;
-    }
-
-    activeAudioSources = [];
-    isGeminiSpeaking = false;
+	activeAudioSources.forEach(source => {
+		try {
+			source.stop();
+		} catch (e) {}
+	});
+	activeAudioSources = [];
+	if (audioOutputContext) nextStartTime = audioOutputContext.currentTime;
 }
 
 function convertFloat32ToInt16(float32Array) {
 	const buffer = new ArrayBuffer(float32Array.length * 2);
 	const view = new DataView(buffer);
 	for (let i = 0; i < float32Array.length; i++) {
-		let sample = float32Array[i];
+		let sample = float32Array[i] * 1.5;
 		sample = Math.max(-1, Math.min(1, sample));
 		const int16 = sample < 0 ? sample * 0x8000 : sample * 0x7FFF;
 		view.setInt16(i * 2, int16, true);
@@ -530,28 +349,11 @@ function arrayBufferToBase64(buffer) {
 	return window.btoa(binary);
 }
 
-function createAudioBufferFromPCM16(int16Array, audioCtx, sampleRate = 24000) {
-    const buffer = audioCtx.createBuffer(1, int16Array.length, sampleRate);
-    const channelData = buffer.getChannelData(0);
-    const len = int16Array.length;
-
-    for (let i = 0; i < len; i++) {
-        // Chuẩn hóa dải âm thanh [-1.0, 1.0]
-        channelData[i] = int16Array[i] / 32768.0;
-    }
-
-	// Tùy chọn: Khử click/tạch nhẹ ở 2 mép biên chunk bằng fade ngắn (8-12ms)
-	const fadeMs = 0.01; // 10ms fade
-	const fadeSamples = Math.min(Math.floor(sampleRate * fadeMs), Math.floor(len / 2));
-	if (fadeSamples > 0) {
-		for (let i = 0; i < fadeSamples; i++) {
-			const gain = i / fadeSamples;
-			channelData[i] *= gain;
-			channelData[len - 1 - i] *= gain;
-		}
-	}
-
-    return buffer;
+function createAudioBufferFromPCM16(int16Array, audioCtx, sampleRate) {
+	const buffer = audioCtx.createBuffer(1, int16Array.length, sampleRate);
+	const channelData = buffer.getChannelData(0);
+	for (let i = 0; i < int16Array.length; i++) channelData[i] = int16Array[i] / 32768.0;
+	return buffer;
 }
 
 function base64ToArrayBuffer(base64) {
@@ -562,60 +364,137 @@ function base64ToArrayBuffer(base64) {
 	return bytes.buffer;
 }
 
-function pcm16Base64ToWavBlob(base64, sampleRate = 24000) {
-	const pcmBuffer = base64ToArrayBuffer(base64);
-	const pcm16 = new Int16Array(pcmBuffer);
-	const bytesPerSample = 2;
-	const blockAlign = bytesPerSample * 1;
-	const byteRate = sampleRate * blockAlign;
-	const dataSize = pcm16.length * bytesPerSample;
-	const buffer = new ArrayBuffer(44 + dataSize);
-	const view = new DataView(buffer);
-	// RIFF identifier
-	writeString(view, 0, 'RIFF');
-	view.setUint32(4, 36 + dataSize, true);
-	writeString(view, 8, 'WAVE');
-	// fmt chunk
-	writeString(view, 12, 'fmt ');
-	view.setUint32(16, 16, true); // chunk size
-	view.setUint16(20, 1, true); // PCM format
-	view.setUint16(22, 1, true); // channels
-	view.setUint32(24, sampleRate, true);
-	view.setUint32(28, byteRate, true);
-	view.setUint16(32, blockAlign, true);
-	view.setUint16(34, 16, true); // bits per sample
-	// data chunk
-	writeString(view, 36, 'data');
-	view.setUint32(40, dataSize, true);
-	// PCM samples
-	let offset = 44;
-	for (let i = 0; i < pcm16.length; i++, offset += 2) {
-		view.setInt16(offset, pcm16[i], true);
-	}
-	return new Blob([view], { type: 'audio/wav' });
-}
-
-function writeString(view, offset, string) {
-	for (let i = 0; i < string.length; i++) {
-		view.setUint8(offset + i, string.charCodeAt(i));
-	}
-}
-
-async function playAudioViaAudioElement(base64Audio, sampleRate = 24000) {
+async function recordAndSend(seconds = 5) {
+	if (!ws || ws.readyState !== WebSocket.OPEN) throw new Error('WebSocket chưa kết nối');
+	const durationMs = seconds * 1000;
+	const sampleRate = 16000;
+	const targetSamples = Math.ceil(seconds * sampleRate);
 	try {
-		const wavBlob = pcm16Base64ToWavBlob(base64Audio, sampleRate);
-		const url = URL.createObjectURL(wavBlob);
-		const audio = new Audio(url);
-		currentAudioElement = audio;
-		audio.autoplay = true;
-		audio.play().catch(err => console.error('Audio element play failed', err));
-		audio.onended = () => {
-			URL.revokeObjectURL(url);
-			if (currentAudioElement === audio) currentAudioElement = null;
+		mediaStream = await navigator.mediaDevices.getUserMedia({
+			audio: {
+				channelCount: 1,
+				sampleRate
+			}
+		});
+		audioInputContext = new(window.AudioContext || window.webkitAudioContext)({
+			sampleRate
+		});
+		const source = audioInputContext.createMediaStreamSource(mediaStream);
+		const buffers = [];
+		let recorded = 0;
+		let finished = false;
+		let localScriptProc = null;
+		const finish = async () => {
+			if (finished) return;
+			finished = true;
+			try {
+				if (localScriptProc) localScriptProc.disconnect();
+			} catch (e) {}
+			try {
+				source.disconnect();
+			} catch (e) {}
+			try {
+				mediaStream.getTracks().forEach(t => t.stop());
+			} catch (e) {}
+			const full = new Float32Array(recorded);
+			let offset = 0;
+			for (const b of buffers) {
+				full.set(b, offset);
+				offset += b.length;
+			}
+			const finalSamples = full.subarray(0, Math.min(full.length, targetSamples));
+			const chunkSize = 3200;
+			const chunkDurationMs = 200;
+			const total = finalSamples.length;
+			for (let i = 0; i < total; i += chunkSize) {
+				if (!ws || ws.readyState !== WebSocket.OPEN) break;
+				const slice = finalSamples.subarray(i, Math.min(i + chunkSize, total));
+				const pcmUint8 = convertFloat32ToInt16(slice);
+				const base64 = arrayBufferToBase64(pcmUint8);
+				ws.send(JSON.stringify({
+					realtimeInput: {
+						mediaChunks: [{
+							mimeType: 'audio/pcm;rate=16000',
+							data: base64
+						}]
+					}
+				}));
+				await new Promise(r => setTimeout(r, chunkDurationMs));
+			}
+			if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({
+				clientContent: {
+					turns: [{
+						role: 'user',
+						parts: []
+					}],
+					turnComplete: true
+				}
+			}));
+			alreadyRecordedOnce = true;
+			try {
+				await audioInputContext.close();
+			} catch (e) {}
+			audioInputContext = null;
+			localScriptProc = null;
+			mediaStream = null;
 		};
-		console.log('playAudioViaAudioElement: playing fallback audio element');
-	} catch (e) {
-		console.error('playAudioViaAudioElement error', e);
+		try {
+			await audioInputContext.audioWorklet.addModule('recorder-processor.js');
+			localScriptProc = new AudioWorkletNode(audioInputContext, 'recorder-processor', {
+				numberOfInputs: 1,
+				numberOfOutputs: 1,
+				outputChannelCount: [1]
+			});
+			localScriptProc.port.onmessage = (e) => {
+				const input = e.data;
+				const copy = new Float32Array(input.length);
+				copy.set(input);
+				buffers.push(copy);
+				recorded += copy.length;
+				if (recorded >= targetSamples) setTimeout(() => {
+					finish();
+				}, 0);
+			};
+			source.connect(localScriptProc);
+			localScriptProc.connect(audioInputContext.destination);
+		} catch (err) {
+			localScriptProc = audioInputContext.createScriptProcessor(4096, 1, 1);
+			localScriptProc.onaudioprocess = (e) => {
+				const input = e.inputBuffer.getChannelData(0);
+				const copy = new Float32Array(input.length);
+				copy.set(input);
+				buffers.push(copy);
+				recorded += copy.length;
+				if (recorded >= targetSamples) setTimeout(() => {
+					finish();
+				}, 0);
+			};
+			source.connect(localScriptProc);
+			localScriptProc.connect(audioInputContext.destination);
+		}
+		await new Promise(r => setTimeout(r, durationMs + 100));
+		if (recorded < targetSamples) await new Promise(r => setTimeout(r, 50));
+		await finish();
+	} catch (err) {
+		try {
+			if (scriptProcessor) {
+				scriptProcessor.disconnect();
+				scriptProcessor = null;
+			}
+		} catch (e) {}
+		try {
+			if (mediaStream) {
+				mediaStream.getTracks().forEach(t => t.stop());
+				mediaStream = null;
+			}
+		} catch (e) {}
+		try {
+			if (audioInputContext) {
+				await audioInputContext.close();
+				audioInputContext = null;
+			}
+		} catch (e) {}
+		throw err;
 	}
 }
 
@@ -625,11 +504,16 @@ function wait(ms) {
 }
 
 function setConnectionState(state, label) {
+	console.log(`🔄 setConnectionState('${state}', '${label}')`);
+	console.log('  → connectionDot hiện tại:', connectionDot);
+	console.log('  → connectionLabel hiện tại:', connectionLabel);
 	connectionDot.className = 'status-dot';
 	if (state === 'connecting') connectionDot.classList.add('is-connecting');
 	if (state === 'connected') connectionDot.classList.add('is-connected');
 	if (state === 'error') connectionDot.classList.add('is-error');
 	connectionLabel.textContent = label;
+	console.log('  → connectionDot.className sau thay đổi:', connectionDot.className);
+	console.log('  → connectionLabel.textContent sau thay đổi:', connectionLabel.textContent);
 }
 
 /* ====== AVATAR STATE ====== */
@@ -715,73 +599,143 @@ function updateFullscreenButtonState() {
 	}
 }
 
-function resetAudioOutputState() {
-	resetAudioOutputState();
-    activeAudioSources.forEach(source => {
-        try { source.stop(); } catch (e) {}
-    });
-    activeAudioSources = [];
-    if (typeof pendingAudioQueue !== 'undefined') {
-        pendingAudioQueue = [];
-    }
-    if (audioOutputContext) {
-        // Reset mốc thời gian nối chuỗi về hiện tại
-        nextStartTime = audioOutputContext.currentTime;
-    }
+/* ====== GIF FAQ ====== */
+async function playGifSequence(gifList) {
+	console.log('📺 Phát chuỗi GIF FAQ:', gifList);
+
+	if (!gifList || gifList.length === 0) {
+		console.log('ℹ️ Không có GIF nào để phát');
+		return;
+	}
+
+	// Hiển thị FAQ panel & thu nhỏ avatar
+	isFaqVisible = true;
+	applyFaqState(true);
+
+	const faqGifWrap = document.querySelector('.faq-gif-wrap');
+
+	// Phát từng GIF trong danh sách
+	for (const gifFile of gifList) {
+		console.log('🎬 Phát GIF:', gifFile);
+
+		// Tạo/cập nhật thẻ img hoặc video
+		let mediaElement = faqGifWrap.querySelector('img') || faqGifWrap.querySelector('video');
+
+		if (!mediaElement) {
+			// Nếu là video, tạo video element
+			if (gifFile.endsWith('.mp4') || gifFile.endsWith('.webm')) {
+				mediaElement = document.createElement('video');
+				mediaElement.className = 'faq-gif';
+				mediaElement.autoplay = true;
+				mediaElement.loop = false;
+				mediaElement.muted = true;
+				mediaElement.playsinline = true;
+			} else {
+				// Nếu là GIF/PNG, tạo img element
+				mediaElement = document.createElement('img');
+				mediaElement.className = 'faq-gif';
+			}
+			faqGifWrap.innerHTML = '';
+			faqGifWrap.appendChild(mediaElement);
+		}
+
+		// Cập nhật source
+		if (mediaElement.tagName === 'VIDEO') {
+			mediaElement.innerHTML = `<source src="assets/faq_media/${gifFile}" type="video/mp4">`;
+		} else {
+			mediaElement.src = `assets/faq_media/${gifFile}`;
+		}
+
+		// Phát 4 giây cho mỗi GIF
+		await new Promise(resolve => setTimeout(resolve, 4000));
+	}
+
+	console.log('✓ Phát xong chuỗi GIF FAQ');
+
+	// Giữ FAQ panel mở trong 2 giây nữa rồi đóng
+	setTimeout(() => {
+		if (!isGeminiSpeaking) {
+			isFaqVisible = false;
+			applyFaqState(false);
+		}
+	}, 2000);
 }
 
 /* ====== USER SPEAKING DETECTION ====== */
 function detectUserSpeaking() {
-    // Vẫn ghi nhận thông tin & gửi lên WS, KHÔNG gọi stopCurrentAudio()
-    if (!isUserSpeakingActive) {
-        if (isGeminiSpeaking) {
-            userInterruptedWhileSpeaking = true;
-        }
-        // Bắt đầu gửi âm thanh người dùng lên WS
-        startSendingAudio();
-    }
+	// Khi người dùng bắt đầu nói (có audio input)
+	// Chuyển sang trạng thái "listening"
+	if (currentAvatarState !== 'listening' && !isGeminiSpeaking) {
+		if (DEBUG_FLOW) console.log('🎤 [FLOW] DETECTED USER SPEAKING - Changing avatar state to listening');
+
+		// ⏹️ Stop audio ngay lập tức nếu Gemini đang phát
+		stopCurrentAudio();
+
+		setAvatarState('listening');
+
+		// 🔴 BẮT ĐẦU GỬI AUDIO SANG GEMINI
+		startSendingAudio();
+	}
 }
 
 function stopUserSpeaking() {
 	// Khi người dùng dừng nói
-	// Nếu Gemini không nói, hoặc người dùng đã nói chồng lên AI, tiến hành gửi
-	if ((currentAvatarState === 'listening') || userInterruptedWhileSpeaking) {
+	// Nếu Gemini không nói, quay về idle
+	if (DEBUG_FLOW) {
+		console.log('🤐 [FLOW] stopUserSpeaking() called');
+		console.log('   - isGeminiSpeaking:', isGeminiSpeaking);
+		console.log('   - currentAvatarState:', currentAvatarState);
+	}
+
+	if (!isGeminiSpeaking && currentAvatarState === 'listening') {
+		if (DEBUG_FLOW) console.log('🤐 USER STOPPED SPEAKING - Processing message...');
+
 		// 🔴 DỪNG GỬI AUDIO + GỬI MESSAGE SANG GEMINI NGAY LẬP TỨC
 		stopSendingAudio();
 
 		// Dừng speech recognition
 		if (recognition) {
+			if (DEBUG_FLOW) console.log('🎙️ [FLOW] Calling recognition.stop()');
 			recognition.stop();
 		}
 
 		// 🔴 LƯU final transcript để hiển thị
 		finalUserTranscript = userTranscript.trim();
 
+		// Gửi message từ user transcript (text mà user nói)
 		// Hiển thị user transcript lên màn hình
 		if (finalUserTranscript) {
 			transcriptText.textContent = '🎤 Bạn: ' + finalUserTranscript;
+			if (DEBUG_FLOW) console.log('💬 User transcript displayed:', finalUserTranscript);
 		}
 
 		// Delegate sending/stopping to core implementation (record/send turn)
 		try {
 			stopMicrophoneAndSendTurn();
+			if (DEBUG_FLOW) console.log('📨 Delegated turnComplete to core');
 		} catch (err) {
 			console.error('❌ Lỗi khi gọi core stop/send:', err);
 		}
 		userTranscript = '';
-		userInterruptedWhileSpeaking = false;
+	} else {
+		if (DEBUG_FLOW) console.log('   ❌ Condition not met, skipping message send');
 	}
 }
 
 /* ====== SEND TO GEMINI ====== */
 function startSendingAudio() {
-	if (!localMicStream || isUserSpeakingActive) return;
+	if (!localMicStream || isUserSpeakingActive) {
+		if (DEBUG_FLOW && isUserSpeakingActive) console.warn('⚠️ [FLOW] startSendingAudio skipped - already speaking!');
+		return;
+	}
 
 	// Reset flags để tránh confusion với lần nói trước
 	isGeminiSpeaking = false;
 
 	// Mark that user is now speaking so recognition will start
 	isUserSpeakingActive = true;
+
+	if (DEBUG_FLOW) console.log('🎤 [FLOW] USER STARTED SPEAKING - Initializing speech recognition...');
 
 	// Bắt đầu speech recognition để capture text từ user nói
 	userTranscript = '';
@@ -795,6 +749,7 @@ function startSendingAudio() {
 		setTimeout(() => {
 			if (recognition && isUserSpeakingActive) {
 				recognition.start();
+				if (DEBUG_FLOW) console.log('🎙️ [FLOW] Speech recognition started');
 			}
 		}, 50);
 	}
@@ -812,14 +767,25 @@ function stopSendingAudio() {
 }
 
 /* ====== GEMINI LIVE WEBSOCKET CONNECTION ====== */
+let geminiLiveSession = null;
 let messageHistory = [];
-let pendingResponses = [];
-let userInterruptedWhileSpeaking = false;
-let turnCompleteReceived = false;
-let waitingForMoreTimer = null;
 // The low-level WebSocket / API communication and audio streaming is handled
 // by the core module (script chuẩn.js). Provide light UI-facing wrappers
 // that delegate to the core functions where appropriate.
+
+function buildGeminiWebSocketUrl() {
+	console.warn('buildGeminiWebSocketUrl: delegated to core implementation');
+	return null;
+}
+
+// function sendSetupMessage() {
+// 	console.warn('sendSetupMessage: delegated to core implementation');
+// }
+
+function handleGeminiSocketMessage() {
+	// Core handles server messages and playback; UI doesn't parse WS frames.
+	console.warn('handleGeminiSocketMessage: delegated to core implementation');
+}
 
 function closeGeminiLiveWebSocket() {
 	console.log('closeGeminiLiveWebSocket: delegating to core stop function');
@@ -829,6 +795,125 @@ function closeGeminiLiveWebSocket() {
 		console.error('❌ Error delegating close to core:', err);
 	}
 }
+
+function scheduleGeminiReconnect() {
+	console.warn('scheduleGeminiReconnect: delegated to core (no-op in UI)');
+}
+
+function initGeminiLiveWebSocket() {
+	console.warn('initGeminiLiveWebSocket: delegated to core implementation');
+}
+
+async function initGeminiLiveConnection() {
+	// Initialize core live session which manages WebSocket + mic streaming
+	try {
+		await initLiveSession();
+		return;
+	} catch (err) {
+		console.error('❌ initGeminiLiveConnection failed (core):', err);
+		throw err;
+	}
+}
+
+async function sendMessageViaFetchAPI() {
+	console.warn('sendMessageViaFetchAPI: fetch-based text path is not available in core. UI will not call it.');
+}
+
+function sendMessageViaWebSocket(userMessage) {
+	console.warn('sendMessageViaWebSocket: direct send is delegated to core');
+}
+
+async function sendMessageToGemini(userMessage) {
+	// UI-level helper: show message and hand off to core where possible.
+	if (SIMULATE_GEMINI_RESPONSE) {
+		const simulatedResponses = [
+			'Xin chào! Tôi là trợ lý AI của bạn. Có thể tôi giúp gì cho bạn?',
+			'Đây là một bản test luồng. Avatar đang ở trạng thái speaking.',
+			'Hệ thống hoạt động bình thường. Luồng: listening → speaking → idle.',
+			'Thử nói gì đó với tôi xem sao!',
+			'Luồng đã được cập nhật. Avatar sẽ tự chuyển trạng thái.'
+		];
+		const responseText = simulatedResponses[Math.floor(Math.random() * simulatedResponses.length)];
+		transcriptText.textContent = responseText;
+		speakText(responseText);
+		setTimeout(() => {
+			if (!isAvatarInCornerMode) setAvatarState('idle');
+		}, 5000);
+		return;
+	}
+
+	// In the new structure, text-based sends are not handled here; prefer audio streaming.
+	console.log('sendMessageToGemini: UI received message, delegating to core audio path if available');
+	transcriptText.textContent = userMessage;
+}
+
+/* ====== CONVERT PCM TO WAV ====== */
+// PCM->WAV conversion handled by core; UI does not convert audio data.
+function pcmToWav() {
+	console.warn('pcmToWav: conversion delegated to core; this UI stub should not be used');
+	return null;
+}
+
+/* ====== PLAY AUDIO ====== */
+function playHelloAudio() {
+	console.log('🎵 Phát hello.mp3...');
+
+	// Tạo hoặc tái sử dụng audio element
+	let audioElement = window.helloAudioElement;
+	if (!audioElement) {
+		audioElement = new Audio('assets/audio/hello.mp3');
+		window.helloAudioElement = audioElement;
+	}
+
+	// Reset và phát
+	audioElement.currentTime = 0;
+	audioElement.play().catch(err => {
+		console.error('❌ Lỗi phát hello.mp3:', err);
+	});
+
+	audioElement.onended = () => {
+		console.log('✓ Phát hello.mp3 xong');
+	};
+}
+
+/* ====== TEXT-TO-SPEECH: BROWSER ====== */
+function speakText(text) {
+	if (!('speechSynthesis' in window)) {
+		console.error('❌ Browser không hỗ trợ Text-to-Speech');
+		return;
+	}
+
+	window.speechSynthesis.cancel();
+
+	const utterance = new SpeechSynthesisUtterance(text);
+	utterance.lang = 'vi-VN';
+	utterance.rate = 1.0;
+	utterance.pitch = 1.0;
+	utterance.volume = 1.0;
+
+	utterance.onstart = () => {
+		if (DEBUG_FLOW) console.log('🔊 [FLOW] Browser TTS started');
+	};
+
+	utterance.onend = () => {
+		if (DEBUG_FLOW) console.log('✅ [FLOW] Browser TTS finished');
+		isGeminiSpeaking = false;
+		setAvatarState('idle');
+		if (!isAvatarInCornerMode) {
+			setupMicVolumeDetection();
+		}
+	};
+
+	utterance.onerror = (event) => {
+		console.error('❌ Lỗi Browser TTS:', event.error);
+		isGeminiSpeaking = false;
+	};
+
+	window.speechSynthesis.speak(utterance);
+}
+
+
+
 
 /* ====== SPEECH RECOGNITION SETUP ====== */
 function initSpeechRecognition() {
@@ -855,9 +940,10 @@ function initSpeechRecognition() {
 
 			if (event.results[i].isFinal) {
 				userTranscript += transcript + ' ';
-				
+				if (DEBUG_FLOW) console.log('✅ FINAL TRANSCRIPT CAPTURED:', transcript);
 			} else {
 				interim += transcript;
+				console.log('~ Interim:', interim);
 			}
 		}
 
@@ -874,9 +960,12 @@ function initSpeechRecognition() {
 	};
 
 	recognition.onend = () => {
-		if (isUserSpeakingActive && recognition) {
-			try { recognition.start(); } catch(e) {}
-		}
+		if (DEBUG_FLOW) console.log('🎤 [FLOW] Speech recognition ENDED event');
+
+		// 🔴 AUTO-TRIGGER stopUserSpeaking when speech recognition ends
+		// (người dùng đã dừng nói, không còn audio input)
+		if (DEBUG_FLOW) console.log('🎤 [FLOW] Auto-triggering stopUserSpeaking() because speech recognition ended');
+		stopUserSpeaking();
 	};
 
 	console.log('✓ Speech recognition initialized (Tiếng Việt)');
@@ -886,20 +975,31 @@ function initSpeechRecognition() {
 let currentAudioElement = null;
 
 function stopCurrentAudio() {
-	// Stop any active Audio element
 	if (currentAudioElement && !currentAudioElement.paused) {
-		try { currentAudioElement.pause(); } catch (e) {}
+		if (DEBUG_FLOW) console.log('⏹️ [INTERRUPT] Dừng audio phát hiện người dùng nói');
+		currentAudioElement.pause();
 		currentAudioElement = null;
 	}
-	// Stop any AudioContext buffer sources
-	stopAllAudioOutputs();
 }
 
 /* ====== CONNECT GEMINI ====== */
 async function connectGeminiLiveSocket() {
 	console.log('  → connectGeminiLiveSocket bắt đầu...');
-	const delay = 0;
+	const delay = DEV_MODE ? 100 : 0; // Giảm delay từ 600ms xuống 0
 	if (delay > 0) await wait(delay);
+
+	// Tải dữ liệu FAQ
+	// 🔴 DISABLE: Bỏ qua FAQ để test
+	/*
+	try {
+		const faqResponse = await fetch('./data/faq.json');
+		faqData = await faqResponse.json();
+		console.log('✓ FAQ data đã load:', faqData.length, 'items');
+	} catch (err) {
+		console.warn('⚠️ Lỗi load FAQ:', err.message);
+		faqData = [];
+	}
+	*/
 	faqData = [];
 	console.log('✓ FAQ data DISABLED (test mode)');
 
@@ -932,18 +1032,34 @@ async function connectGeminiLiveSocket() {
 
 /* ====== START BUTTON ====== */
 async function handleStartClick() {
-	window.apiKey = document.getElementById('hiddenInput')?.value;
+	window.GEMINI_API_KEY = document.getElementById('hiddenInput')?.value;
+	GEMINI_LIVE_CONFIG.apiKey = window.GEMINI_API_KEY;
+	console.log('🔑 API key set from hidden input:', window.GEMINI_API_KEY);
 	startBtn.disabled = true;
-	startBtn.textContent = 'Đang xin quyền micro...';
+	startBtn.textContent = DEV_MODE ? 'Đang vào chế độ dev...' : 'Đang xin quyền micro...';
 	permissionError.style.display = 'none';
 
 	try {
 		console.log('1️⃣ Bắt đầu quá trình bật ứng dụng...');
 
-		// 1. Yêu cầu quyền Micro
-		console.log('2️⃣ Yêu cầu quyền micro...');
-		localMicStream = await navigator.mediaDevices.getUserMedia(audioConstraints);
-		console.log('✓ Đã cấp quyền micro thành công');
+		// 🔴 IN RA MODE HIỆN TẠI
+		if (SIMULATE_GEMINI_RESPONSE) {
+			console.log('🎭 [SIMULATE MODE] - Sẽ dùng response text cứng');
+		} else if (DEV_MODE) {
+			console.log('🔧 [DEV MODE] - Bypass micro');
+		} else {
+			console.log('📱 [PRODUCTION MODE] - Sẽ xin quyền micro thực');
+		}
+
+		// 1. Xin quyền mở Micro (hoặc skip nếu dev mode)
+		if (!DEV_MODE) {
+			console.log('2️⃣ Yêu cầu quyền micro...');
+			localMicStream = await navigator.mediaDevices.getUserMedia(audioConstraints);
+			console.log('✓ Đã cấp quyền micro thành công');
+		} else {
+			console.log('2️⃣ 🔧 Dev mode: bypass quyền micro');
+			localMicStream = null;
+		}
 
 		console.log('3️⃣ Chuyển sang màn hình ứng dụng...');
 		welcomeScreen.style.display = 'none';
@@ -965,20 +1081,18 @@ async function handleStartClick() {
 			setConnectionState('connected', 'Đã kết nối');
 
 			// 5. Thiết lập phát hiện micro input (nếu có micro stream)
-			if (localMicStream) {
+			if (localMicStream && !DEV_MODE) {
 				console.log('5️⃣ Thiết lập phát hiện âm thanh micro...');
-					// Resume audio output context (user gesture present) to ensure playback
-					if (audioOutputContext && audioOutputContext.state === 'suspended') {
-						try {
-							await audioOutputContext.resume();
-							console.log('✓ Resumed audioOutputContext after user gesture');
-						} catch (e) {
-							console.warn('Could not resume audioOutputContext', e);
-						}
-					}
-					setupMicVolumeDetection();
+				setupMicVolumeDetection();
 			} else {
-				console.log('5️⃣ Không có micro: không thiết lập volume detection');
+				// DEV_MODE hoặc không có micro → dùng phím tắt
+				console.log('5️⃣ Dev mode hoặc không có micro: sử dụng phím tắt để test');
+				console.log('   Nhấn phím "L" để test listening');
+				console.log('   Nhấn phím "K" để test stop & gửi message');
+				console.log('   Nhấn phím "M" để gửi message trực tiếp');
+				console.log('   Nhấn phím "S" để test speaking');
+				console.log('   Nhấn phím "G" để toggle FAQ');
+				setupDevModeShortcuts();
 			}
 		} catch (connectionErr) {
 			console.error('✗ Lỗi kết nối:', connectionErr);
@@ -1010,13 +1124,13 @@ async function handleStartClick() {
 /* ====== VOLUME DETECTION ====== */
 let silenceTimeout = null;
 let volumeDetectionAnimationId = null;
-const SILENCE_THRESHOLD = 600; // ms - chờ 0.6 giây im lặng mới gửi
-const VOLUME_THRESHOLD = 0.02; // tuned: ignore light background noise
+const SILENCE_THRESHOLD = 1000; // ms - chờ 1 giây im lặng mới gửi (từ 800ms)
 let isVolumeDetectionActive = false; // Track nếu detection đang chạy
 
 function setupMicVolumeDetection() {
 	if (!localMicStream) return;
 	if (isVolumeDetectionActive) {
+		if (DEBUG_FLOW) console.log('⚠️ Volume detection already active, skipping');
 		return;
 	}
 
@@ -1025,34 +1139,37 @@ function setupMicVolumeDetection() {
 	const microphone = audioContext.createMediaStreamSource(localMicStream);
 
 	microphone.connect(analyser);
-	// Use time-domain data for RMS detection
-	analyser.fftSize = 2048;
+	analyser.fftSize = 256;
 
-	const timeData = new Uint8Array(analyser.fftSize);
-	const RMS_THRESHOLD = 0.02; // tuned: ignore light background noise
+
+	const dataArray = new Uint8Array(analyser.frequencyBinCount);
+	const VOLUME_THRESHOLD = 80;
 	let lastSpokeTime = Date.now();
 
 	isVolumeDetectionActive = true; // 🔴 Mark as active
 
 	function checkVolume() {
-		analyser.getByteTimeDomainData(timeData);
-		// convert to normalized -1..1 and compute RMS
-		let sum = 0;
-		for (let i = 0; i < timeData.length; i++) {
-			const v = (timeData[i] - 128) / 128;
-			sum += v * v;
-		}
-		const rms = Math.sqrt(sum / timeData.length);
+		analyser.getByteFrequencyData(dataArray);
+		const average = dataArray.reduce((a, b) => a + b) / dataArray.length;
 
-		if (rms > RMS_THRESHOLD) {
+		// 🔴 DEBUG: In ra volume hiện tại mỗi 1 giây
+		// if (Math.random() < 0.05) { // ~5% chance để không spam log
+		// 	console.log(`📊 Volume: ${average.toFixed(1)} (threshold: ${VOLUME_THRESHOLD})`);
+		// }
+
+		if (average > VOLUME_THRESHOLD) {
+			// Có âm thanh - người dùng đang nói
 			lastSpokeTime = Date.now();
 			clearTimeout(silenceTimeout);
 			if (currentAvatarState !== 'listening') {
+				if (DEBUG_FLOW) console.log(`🎤 [FLOW] AUDIO DETECTED (volume: ${average.toFixed(1)}), calling detectUserSpeaking`);
 				detectUserSpeaking();
 			}
 		} else {
+			// Không có âm thanh - chờ xem có tiếp tục nói không
 			clearTimeout(silenceTimeout);
 			silenceTimeout = setTimeout(() => {
+				if (DEBUG_FLOW) console.log('⏱️ [FLOW] SILENCE TIMEOUT - Stopping user speaking');
 				stopUserSpeaking();
 			}, SILENCE_THRESHOLD);
 		}
@@ -1078,6 +1195,47 @@ function stopVolumeDetection() {
 	}
 	isVolumeDetectionActive = false; // 🔴 Mark as inactive
 	console.log('✓ Volume detection đã dừng');
+}
+
+// 🔴 FIX: Reset volume detection khi quay về idle
+function resetMicVolumeDetection() {
+	stopVolumeDetection();
+	if (localMicStream) {
+		console.log('🔄 Reset volume detection để listening lại');
+		setupMicVolumeDetection();
+	}
+}
+
+/* ====== DEV MODE SHORTCUTS ====== */
+function setupDevModeShortcuts() {
+	document.addEventListener('keydown', (e) => {
+		// L: mô phỏng người dùng nói
+		if (e.key === 'l' || e.key === 'L') {
+			console.log('🔑 [DEV] Phím L: listening state');
+			detectUserSpeaking();
+		}
+
+		// K: dừng nói + gửi message
+		if (e.key === 'k' || e.key === 'K') {
+			console.log('🔑 [DEV] Phím K: stop + send message');
+			stopUserSpeaking();
+		}
+
+		// G: toggle FAQ
+		if (e.key === 'g' || e.key === 'G') {
+			console.log('🔑 [DEV] Phím G: toggle FAQ');
+			isFaqVisible = !isFaqVisible;
+			applyFaqState(isFaqVisible);
+		}
+
+		// M: gửi message test
+		if (e.key === 'm' || e.key === 'M') {
+			console.log('🔑 [DEV] Phím M: send test message');
+			// if (window.geminiChat) {
+			sendMessageToGemini('Cho tôi biết đây là gì?');
+			// }
+		}
+	});
 }
 
 /* ====== EVENT LISTENERS ====== */
@@ -1241,4 +1399,19 @@ document.addEventListener('DOMContentLoaded', () => {
 /* ====== ENVIRONMENT NOTES ====== */
 if (location.protocol !== 'https:' && location.hostname !== 'localhost' && location.hostname !== '127.0.0.1') {
 	console.warn('Cảnh báo: trang này cần chạy trên HTTPS hoặc localhost để Micro và WebRTC hoạt động.');
+}
+
+function core_closeWebSocket() {
+	try {
+		if (core_ws) {
+			core_ws.onopen = null;
+			core_ws.onmessage = null;
+			core_ws.onerror = null;
+			core_ws.onclose = null;
+			if (core_ws.readyState === WebSocket.OPEN || core_ws.readyState === WebSocket.CONNECTING) core_ws.close();
+			core_ws = null;
+		}
+	} catch (e) {
+		console.warn('core_closeWebSocket error', e);
+	}
 }
