@@ -933,6 +933,7 @@ async function connectGeminiLiveSocket() {
 /* ====== START BUTTON ====== */
 async function handleStartClick() {
 	window.apiKey = document.getElementById('hiddenInput')?.value;
+	window.GEMINI_API_KEY = window.apiKey;
 	startBtn.disabled = true;
 	startBtn.textContent = 'Đang xin quyền micro...';
 	permissionError.style.display = 'none';
